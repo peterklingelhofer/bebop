@@ -1,0 +1,14 @@
+.venv/
+.venv-extras/
+__pycache__/
+*.pyc
+.DS_Store
+output/
+.bebop_cache/
+
+# vendor build artifacts (re-build with vendor/build_nnls_chroma.sh)
+vendor/vamp-plugin-sdk/build/
+vendor/nnls-chroma/build/
+vendor/nnls-chroma/*.o
+vendor/nnls-chroma/*.dylib
+vendor/nnls-chroma/*.bak
