@@ -35,6 +35,7 @@ from bebop.io.midi_in import parse_midi
 from bebop.reharm import reharmonize
 from bebop.render import MatrixCell, mix_audio, render_midi_to_wav, write_html_report, write_midi
 from bebop.types import ChordSequence
+from bebop.voicing.dynamics import compute_loudness_envelope
 
 
 def _cached(audio_path: Path, source: str, bpm: float, fn) -> ChordSequence:
@@ -88,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--html-report", type=Path, default=None,
                         help="Write a single-page HTML audit with all audio variants embedded, "
                              "the disagreement table, and the chart diff.")
+    parser.add_argument("--duck-hz", type=int, default=200,
+                        help="Cutoff (Hz) for the 'duck song bass' pre-rendered HPF version "
+                             "available as a toggle in the HTML report. Default 200 Hz.")
     parser.add_argument("--bpm", type=float, default=None,
                         help="Override BPM (required for --audio if no --chart provided)")
     parser.add_argument("--midi-offset", type=float, default=None,
@@ -98,11 +102,25 @@ def main(argv: list[str] | None = None) -> int:
                              "default — only useful when MIDI and audio share the same musical t=0 "
                              "(e.g. MIDI was transcribed directly from the WAV).")
     parser.add_argument("--rhythm", default="charleston",
-                        choices=["charleston", "two_and_four", "sustained", "anticipations"])
+                        choices=["charleston", "two_and_four", "sustained", "anticipations"],
+                        help="Single rhythm template (used when --rhythms isn't passed).")
+    parser.add_argument("--rhythms", default=None,
+                        help="Comma-separated rhythm templates to sweep, e.g. "
+                             "'charleston,anticipations'. Each rhythm × voicing × spice × bass "
+                             "becomes its own variant in the matrix. Choices: charleston, "
+                             "two_and_four, sustained, anticipations. Default: just --rhythm.")
     parser.add_argument("--voicings", default="rootless,evans,drop2,quartal",
                         help="Comma-separated voicing styles. Each emits its own MIDI/WAV/mix file. "
                              "Choices: rootless, evans, drop2, quartal. Default: all four.")
-    parser.add_argument("--no-bass", action="store_true", help="Skip the bass track")
+    parser.add_argument("--no-bass", action="store_true",
+                        help="Skip the bass track entirely. By default, every variant in the "
+                             "matrix is rendered twice — once with sustained-root bass and once "
+                             "with quarter-note walking bass — so you can compare both.")
+    parser.add_argument("--follow-dynamics", action="store_true",
+                        help="Scale comp note velocities by the audio's RMS loudness envelope so "
+                             "the comp swells with the song instead of playing flat. Off by default. "
+                             "Requires an audio source (--mix-with, --audio, or any other audio flag) "
+                             "since the envelope is computed from one of those WAVs.")
     parser.add_argument("--print", action="store_true", dest="print_prog",
                         help="Print the chord progression(s) to stdout")
 
@@ -240,6 +258,15 @@ def main(argv: list[str] | None = None) -> int:
     if not voicings:
         parser.error("--voicings must list at least one style")
 
+    if args.rhythms:
+        rhythms = [r.strip() for r in args.rhythms.split(",") if r.strip()]
+    else:
+        rhythms = [args.rhythm]
+    valid_rhythms = {"charleston", "two_and_four", "sustained", "anticipations"}
+    for r in rhythms:
+        if r not in valid_rhythms:
+            parser.error(f"--rhythms entry {r!r} not in {sorted(valid_rhythms)}")
+
     if args.spice_sweep:
         try:
             spice_values = [float(s.strip()) for s in args.spice_sweep.split(",") if s.strip()]
@@ -249,11 +276,27 @@ def main(argv: list[str] | None = None) -> int:
         spice_values = [args.spice]
 
     base_path = args.out
-    multi = len(spice_values) > 1 or len(voicings) > 1
+    bass_styles = ["none"] if args.no_bass else ["sustained", "walking"]
+    n_variants = len(spice_values) * len(voicings) * len(rhythms) * len(bass_styles)
+    multi = n_variants > 1
+
+    # ── compute the loudness envelope once if --follow-dynamics ──
+    dynamics_env: list[float] | None = None
+    if args.follow_dynamics:
+        env_audio = (args.mix_with or args.audio or args.basic_pitch
+                     or args.autochord_path or args.chordino_path)
+        if env_audio is None:
+            parser.error("--follow-dynamics requires an audio file source "
+                         "(--mix-with, --audio, --basic-pitch, --autochord, or --chordino).")
+        env_bpm = args.bpm or seq.bpm
+        print(f"\ncomputing loudness envelope from {env_audio.name} ...")
+        dynamics_env = compute_loudness_envelope(env_audio, bpm=env_bpm)
+        print(f"  envelope: {len(dynamics_env)} beats, "
+              f"min={min(dynamics_env):.2f}, max={max(dynamics_env):.2f}")
 
     print()
-    print(f"=== rendering matrix: {len(spice_values)} spice × {len(voicings)} voicing"
-          f" = {len(spice_values) * len(voicings)} variants ===")
+    print(f"=== rendering matrix: {len(spice_values)} spice × {len(voicings)} voicing × "
+          f"{len(rhythms)} rhythm × {len(bass_styles)} bass = {n_variants} variants ===")
 
     matrix_cells: list[MatrixCell] = []
     for spice in spice_values:
@@ -262,35 +305,45 @@ def main(argv: list[str] | None = None) -> int:
             _print_progression(f"REHARMONIZED (spice={spice})", reharmed)
 
         for voicing in voicings:
-            if multi:
-                stem = base_path.stem
-                spice_str = f"spice{int(round(spice * 100)):02d}"
-                midi_path = base_path.with_name(f"{stem}.{spice_str}.{voicing}{base_path.suffix}")
-            else:
-                midi_path = base_path
+            for rhythm in rhythms:
+                for bass_style in bass_styles:
+                    if multi:
+                        stem = base_path.stem
+                        spice_str = f"spice{int(round(spice * 100)):02d}"
+                        name_parts = [stem, spice_str, voicing]
+                        if len(rhythms) > 1:
+                            name_parts.append(rhythm)
+                        if bass_style != "none":
+                            name_parts.append(bass_style)
+                        midi_path = base_path.with_name(".".join(name_parts) + base_path.suffix)
+                    else:
+                        midi_path = base_path
 
-            midi_out = write_midi(reharmed, midi_path, rhythm=args.rhythm,
-                                  include_bass=not args.no_bass, voicing=voicing)
-            tag = f"spice={spice:.2f} {voicing:<8}"
-            print(f"[{tag}] MIDI: {midi_out}")
+                    midi_out = write_midi(reharmed, midi_path, rhythm=rhythm,
+                                          include_bass=(bass_style != "none"), voicing=voicing,
+                                          walking_bass=(bass_style == "walking"),
+                                          dynamics_envelope=dynamics_env)
+                    tag = f"spice={spice:.2f} {voicing:<8} {rhythm:<13} {bass_style:<9}"
+                    print(f"[{tag}] MIDI: {midi_out}")
 
-            wav_out: Path | None = None
-            mix_out: Path | None = None
-            if args.render_audio or args.mix_with:
-                wav_out = midi_out.with_suffix(".wav")
-                render_midi_to_wav(midi_out, wav_out, soundfont_path=args.soundfont)
-                print(f"[{tag}] WAV:  {wav_out}")
+                    wav_out: Path | None = None
+                    mix_out: Path | None = None
+                    if args.render_audio or args.mix_with:
+                        wav_out = midi_out.with_suffix(".wav")
+                        render_midi_to_wav(midi_out, wav_out, soundfont_path=args.soundfont)
+                        print(f"[{tag}] WAV:  {wav_out}")
 
-                # only pre-render the mix.wav when there's no HTML report —
-                # the HTML report mixes in-browser at user-controlled volumes
-                if args.mix_with and not args.html_report:
-                    mix_out = midi_out.with_suffix(".mix.wav")
-                    mix_audio(wav_out, args.mix_with, mix_out,
-                              comp_gain_db=args.comp_gain_db, original_gain_db=args.song_gain_db)
-                    print(f"[{tag}] MIX:  {mix_out}")
+                        if args.mix_with and not args.html_report:
+                            mix_out = midi_out.with_suffix(".mix.wav")
+                            mix_audio(wav_out, args.mix_with, mix_out,
+                                      comp_gain_db=args.comp_gain_db,
+                                      original_gain_db=args.song_gain_db)
+                            print(f"[{tag}] MIX:  {mix_out}")
 
-            matrix_cells.append(MatrixCell(spice=spice, voicing=voicing,
-                                           midi_path=midi_out, wav_path=wav_out, mix_path=mix_out))
+                    matrix_cells.append(MatrixCell(
+                        spice=spice, voicing=voicing, rhythm=rhythm, bass=bass_style,
+                        midi_path=midi_out, wav_path=wav_out, mix_path=mix_out,
+                    ))
 
     if args.html_report:
         hand_text = args.chart.read_text() if args.chart else None
@@ -305,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
             hand_chart_text=hand_text,
             suggested_chart_text=suggested_text,
             original_audio_path=args.mix_with,
+            duck_hpf_hz=args.duck_hz,
         )
         print(f"\nwrote HTML report: {report_path}")
 

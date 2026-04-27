@@ -1,0 +1,72 @@
+# butterfly boy — derived from MIDI + audio detector consensus
+# Methodology: roots taken from audio chromagram (sees the bass), qualities
+# taken from Melodyne MIDI (sees the guitar voicings). Sections and key
+# changes confirmed by both detectors agreeing on the boundaries.
+#
+# CONFIDENCE NOTES (please audit):
+#   - INTRO + BRIDGE sections are best-guesses. Both detectors locked onto a
+#     flat-key region but disagreed on the exact tonic. I went with audio's
+#     reading (it sees the bass).
+#   - VERSES (C major) and CHORUS (D major) are high-confidence — both
+#     detectors agree strongly across the whole section.
+#   - OUTRO modulation to E is from the audio detector only; MIDI stayed in
+#     D. If you hear D, just delete the OUTRO key change.
+
+bpm: 94
+time: 4/4
+key: F        # both detectors agree on a flat-key intro, F major fits the borrowed-chord pattern
+
+# ─────────────────── INTRO (bars 1–8) ────────────────────
+# chords from audio: G G# C C F D#m F G — this fits F major with modal mixture
+# (G = II7, Ab = bIII borrowed, C = V, F = I, Eb = bVII borrowed)
+| G       | Ab      | C       | C       |
+| F       | Eb      | F       | G       |
+
+# ─────────────────── VERSE 1 (bars 9–16) ─────────────────
+key: C
+| F       | C       | C       | C       |
+| C       | G       | C7      | E7      |
+# bar 16 E7 = V/vi setting up the bridge
+
+# ─────────────────── BRIDGE (bars 17–24) ─────────────────
+# AMBIGUOUS — detectors saw G# triads and C#m / G#m suggesting a brief modulation
+# to a sharp key, then returning via Eb back to C. Best guess as C#m → G# pattern
+# resolving back to F → C → F → Eb → ...
+key: C#m
+| C#m     | C#m     | G#7     | G#7     |
+| Fmaj7   | C       | Fmaj7   | Eb      |
+
+# ─────────────────── VERSE 2 (bars 25–32) ─────────────────
+key: C
+| C       | C       | F       | C       |
+| C       | C       | G       | D7      |
+# bar 32 D7 = V/V setting up the modulation to G/D
+
+# ─────────────────── TRANSITION (bars 33–40) ──────────────
+# Audio says D area, MIDI saw F→C→Dm pivots. This is a classic
+# V/V → V → I move into the D-major chorus.
+| D       | A       | G       | D       |
+| Dm7     | D       | D       | A       |
+
+# ─────────────────── CHORUS A (bars 41–48) ────────────────
+key: D
+| A       | D       | A       | D       |
+| A       | D       | A       | D       |
+
+# ─────────────────── CHORUS B (bars 49–56) ────────────────
+| A       | D       | A       | D       |
+| A       | D       | A       | D       |
+
+# ─────────────────── CHORUS C (bars 57–64) ────────────────
+| A       | D       | A       | D       |
+| A       | D       | A       | E       |
+# bar 64 E = V/V — pivots to E for the outro modulation
+
+# ─────────────────── OUTRO (bars 65–77) ───────────────────
+# Audio detected a key change to E here; MIDI kept hearing D voicings.
+# If you hear it as D-major, delete the next `key:` line.
+key: E
+| E       | E       | E       | E       |
+| A       | D       | A       | B7      |
+| E       | E       | E       | F#m7    |
+| E       |

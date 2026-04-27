@@ -34,9 +34,11 @@ bebop \
   --mix-with 'audio/song.wav'
 ```
 
-That produces 20 MIDI files, 20 rendered WAVs, an auto-suggested chord chart,
-and an HTML page where you can A/B all 20 variants against the original at
-your own volume balance.
+That produces 40 MIDI files (5 spice × 4 voicing × 2 bass styles), 40 rendered
+WAVs, an auto-suggested chord chart, and an HTML page where you can A/B all 40
+variants against the original at your own volume balance. Each (spice, voicing)
+cell in the matrix renders **both** sustained-root and quarter-note walking
+bass so you can hear the bass-line difference side by side.
 
 ## Setup
 
@@ -92,6 +94,29 @@ bebop --autochord 'audio/song.wav' --chordino 'audio/song.wav' \
 # then edit charts/song.draft.txt by ear, then re-run with --chart
 ```
 
+### Sweep multiple rhythm patterns alongside voicings
+
+```bash
+bebop --chart charts/song.txt --bpm 94 \
+      --spice-sweep '0.3,0.5' \
+      --voicings rootless,evans \
+      --rhythms charleston,anticipations \
+      --out output/sweep.mid --render-audio
+# 2 spice × 2 voicings × 2 rhythms × 2 bass styles = 16 variants in the matrix
+```
+
+### Make the comp swell with the song
+
+```bash
+bebop --chart charts/song.txt \
+      --audio 'audio/song.wav' \
+      --bpm 94 --spice 0.4 \
+      --voicings rootless --follow-dynamics \
+      --out output/dynamic.mid --render-audio \
+      --mix-with 'audio/song.wav'
+# velocity scales 0.55× (quiet) to 1.20× (loud) following the audio's RMS envelope
+```
+
 ### A/B with the original in the browser
 
 ```bash
@@ -104,6 +129,37 @@ bebop --chart charts/song.txt \
       --out output/m.mid --render-audio \
       --mix-with 'audio/song.wav'
 # open output/song.html in a browser
+```
+
+## Viewing the HTML report
+
+Just **double-click `output/song.html`**. Everything works from `file://` —
+per-cell play buttons, comp volume sliders, the **duck song bass** toggle, the
+disagreement table, and the chord chart diff.
+
+The report writer symlinks the original audio next to the HTML at render time
+and pre-renders a 250 Hz high-passed version (via ffmpeg) right beside it.
+Clicking **☐ duck song bass** in the transport bar swaps the audio src to the
+HPF version while preserving playback position — so you can flip on the fly to
+hear the comp's bass cut through the song. No Web Audio, no local server, no
+CORS issues.
+
+```bash
+PATH="/opt/homebrew/bin:$PATH" ~/.local/bin/uv run bebop \
+  --chart charts/butterfly_boy.txt \
+  --midi 'audio/butterfly boy acoustic guitar MIDI.midi' \
+  --audio 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+  --basic-pitch 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+  --autochord 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+  --chordino 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+  --bpm 94 \
+  --spice-sweep '0.0,0.3,0.5,0.7,0.9' \
+  --voicings rootless,evans,drop2,quartal \
+  --suggest-chart charts/butterfly_boy.suggested.txt \
+  --html-report output/butterfly_boy.html \
+  --out output/matrix.mid \
+  --render-audio \
+  --mix-with 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav'
 ```
 
 ## Chord chart format
@@ -155,8 +211,10 @@ is two beats each in 4/4.
 | Flag | Default | What it does |
 |---|---|---|
 | `--voicings rootless,evans,drop2,quartal` | all four | Comma-separated voicing styles. Each emits its own MIDI/WAV. `rootless` = bass + 3-7-9 shell, `evans` = full Bill Evans LH+RH, `drop2` = 4-note close with 2nd-from-top dropped an octave, `quartal` = stacked 4ths (McCoy Tyner) |
-| `--rhythm STYLE` | `charleston` | Rhythm template. One of `charleston` (beat 1 + "and" of 3), `two_and_four` (Freddie Green chunk), `sustained` (whole-bar pad), `anticipations` (push on "and" of 4) |
-| `--no-bass` | (off) | Skip the bass track entirely |
+| `--rhythm STYLE` | `charleston` | Single rhythm template. One of `charleston` (beat 1 + "and" of 3), `two_and_four` (Freddie Green chunk), `sustained` (whole-bar pad), `anticipations` (push on "and" of 4) |
+| `--rhythms "a,b,c"` | (uses `--rhythm`) | Comma-separated rhythm sweep. Each rhythm × voicing × spice × bass becomes its own matrix variant. e.g. `--rhythms charleston,anticipations` doubles the matrix file count |
+| `--no-bass` | (off) | Skip the bass track entirely. By default, every variant in the matrix is rendered **twice** — once with sustained-root bass, once with quarter-note walking bass — so you can compare both. Walking bass plays beat 1 root, beat 2 fifth, beat 3 third, last beat chromatic approach to the next chord's root |
+| `--follow-dynamics` | (off) | Scale comp note velocities by the audio's RMS loudness envelope so the comp swells with the song instead of playing flat. Computed from `--mix-with` (or any audio source). Range: 0.55× quiet → 1.20× loud, smoothed across 2 beats so phrases breathe rather than each note jumping |
 | `--bpm FLOAT` | from input | Override BPM. Required for `--audio`/`--basic-pitch`/`--autochord`/`--chordino` if no chart provides a bpm |
 
 ### MIDI/audio temporal alignment
@@ -170,7 +228,7 @@ is two beats each in 4/4.
 
 | Flag | What it does |
 |---|---|
-| `--out PATH` | (required) Output MIDI path. With `--spice-sweep` or multiple `--voicings`, the filename gets suffixed: `out.spice30.evans.mid` etc. |
+| `--out PATH` | (required) Output MIDI path. With `--spice-sweep` or multiple `--voicings`, the filename gets suffixed: `out.spice30.evans.sustained.mid`, `out.spice30.evans.walking.mid` etc. |
 | `--render-audio` | Also render each MIDI to a `.wav` via fluidsynth + SoundFont |
 | `--soundfont PATH` | Override SoundFont. Default: `$BEBOP_SOUNDFONT` env, then standard system dirs, then `~/.bebop/soundfonts/*.sf2` |
 | `--mix-with PATH` | A WAV (usually the original song) to mix the comp against. Without `--html-report`, writes a `.mix.wav` per variant. With `--html-report`, the mix happens in-browser at user-controlled volumes (no `.mix.wav` files) |
@@ -183,7 +241,8 @@ is two beats each in 4/4.
 |---|---|
 | `--print` | Print every input source's chord progression and the ensemble consensus to stdout, plus a disagreement report sorted by noisiest bars first |
 | `--suggest-chart PATH` | Write the ensemble consensus as a Real Book-style chord chart you can audit, diff, and edit. Then re-run with that file as `--chart` |
-| `--html-report PATH` | Write a single-page HTML audit. Embeds the original audio, every variant as `<audio>` players, a per-cell mixer with volume sliders, the disagreement table color-coded by severity, and a chord-chart diff (hand vs. ensemble) |
+| `--html-report PATH` | Write a single-page HTML audit. Embeds the original audio, every variant as `<audio>` players, a per-cell mixer with comp volume sliders, a **duck song bass** toggle (swaps in a pre-rendered HPF version of the song so the comp's bass cuts through; cutoff via `--duck-hz`), the disagreement table color-coded by severity, and a chord-chart diff (hand vs. ensemble). Works from `file://` — no local server needed |
+| `--duck-hz N` | Cutoff Hz for the **duck song bass** pre-rendered HPF version. Default `200`. Lower (e.g. `120`) preserves more low-mids of the song; higher (e.g. `400`) is more aggressive and exposes the comp's bass more |
 
 ## Architecture in one line each
 
