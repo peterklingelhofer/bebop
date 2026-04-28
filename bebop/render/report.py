@@ -85,6 +85,18 @@ tr:hover { background: #fafbfc; }
 .matrix { display: grid; gap: 0.7rem; margin-top: 1rem; }
 .matrix-cell { background: #fafafa; padding: 0.7rem; border-radius: 6px;
                border: 1px solid #eaeaea; }
+.matrix-header {
+    /* sticky column headers — stay visible below the transport bar while scrolling */
+    position: sticky;
+    top: var(--transport-height, 180px);
+    z-index: 5;
+}
+.matrix-header-corner {
+    position: sticky;
+    top: var(--transport-height, 180px);
+    z-index: 5;
+    background: #fff;     /* mask the spice column behind it */
+}
 .matrix-cell .label { font-size: 0.7rem; color: #888; text-transform: uppercase;
                       letter-spacing: 0.5px; margin: 0.5rem 0 0.2rem 0; }
 .matrix-cell audio { width: 100%; height: 30px; margin: 0.2rem 0; }
@@ -130,6 +142,19 @@ tr:hover { background: #fafbfc; }
 
 _JS = """
 (() => {
+    // Measure the sticky transport bar's height and feed it to the
+    // --transport-height CSS variable so the matrix's sticky column
+    // headers (.matrix-header) sit just below it without overlap. Re-measures
+    // on resize because the transport wraps differently at narrow widths.
+    const setTransportHeight = () => {
+        const t = document.querySelector('.transport');
+        if (!t) return;
+        const h = t.getBoundingClientRect().height;
+        document.documentElement.style.setProperty('--transport-height', `${h + 8}px`);
+    };
+    setTransportHeight();
+    window.addEventListener('resize', setTransportHeight);
+
     const original = document.getElementById('original-audio');
     const origVol = document.getElementById('original-vol');
     const origVolReadout = document.getElementById('original-vol-readout');
@@ -322,9 +347,9 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
     out.append('<div class="matrix" style="grid-template-columns: 6em '
                + " ".join(["1fr"] * len(voicings)) + ';">')
 
-    out.append('<div></div>')
+    out.append('<div class="matrix-header-corner"></div>')
     for v in voicings:
-        out.append(f'<div class="matrix-cell" style="background: #efefef; text-align: center;">'
+        out.append(f'<div class="matrix-cell matrix-header" style="background: #efefef; text-align: center;">'
                    f'<strong>{html_lib.escape(v)}</strong></div>')
 
     for sp in spices:
