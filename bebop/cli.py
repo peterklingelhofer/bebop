@@ -34,8 +34,16 @@ from bebop.io.extras import parse_autochord, parse_basic_pitch, parse_chordino
 from bebop.io.midi_in import parse_midi
 from bebop.reharm import reharmonize
 from bebop.render import MatrixCell, mix_audio, render_midi_to_wav, write_html_report, write_midi
+from bebop.render.explainer import chart_comparison, voicing_breakdown
 from bebop.types import ChordSequence
 from bebop.voicing.dynamics import compute_loudness_envelope
+
+
+_PITCH_NAMES_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _midi_to_name(midi: int) -> str:
+    return f"{_PITCH_NAMES_SHARP[midi % 12]}{midi // 12 - 1}"
 
 
 def _cached(audio_path: Path, source: str, bpm: float, fn) -> ChordSequence:
@@ -101,6 +109,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="Auto-align MIDI to audio by detecting first onset in each. Off by "
                              "default — only useful when MIDI and audio share the same musical t=0 "
                              "(e.g. MIDI was transcribed directly from the WAV).")
+    parser.add_argument("--align-both", action="store_true",
+                        help="Render every variant TWICE — once with raw MIDI timing and once "
+                             "with first-onset alignment applied — so you can A/B them in the "
+                             "matrix. Implies --first-onset-align if no --midi-offset is given. "
+                             "Doubles the variant count.")
     parser.add_argument("--rhythm", default="charleston",
                         choices=["charleston", "two_and_four", "sustained", "anticipations"],
                         help="Single rhythm template (used when --rhythms isn't passed).")
@@ -113,9 +126,16 @@ def main(argv: list[str] | None = None) -> int:
                         help="Comma-separated voicing styles. Each emits its own MIDI/WAV/mix file. "
                              "Choices: rootless, evans, drop2, quartal. Default: all four.")
     parser.add_argument("--no-bass", action="store_true",
-                        help="Skip the bass track entirely. By default, every variant in the "
-                             "matrix is rendered twice — once with sustained-root bass and once "
-                             "with quarter-note walking bass — so you can compare both.")
+                        help="Skip the bass track entirely.")
+    parser.add_argument("--walking-bass", action="store_true",
+                        help="Also render quarter-note walking bass alongside the default "
+                             "sustained-root bass, so each cell has both for comparison. "
+                             "Default: only sustained-root bass.")
+    parser.add_argument("--piano-bass", action="store_true",
+                        help="Also render variants where the piano doubles the bass line "
+                             "(LH bass at ~85%% of bass velocity), alongside the default "
+                             "upright-bass-only variants. Each cell in the matrix gets both "
+                             "for A/B. Doubles the variant count.")
     parser.add_argument("--follow-dynamics", action="store_true",
                         help="Scale comp note velocities by the audio's RMS loudness envelope so "
                              "the comp swells with the song instead of playing flat. Off by default. "
@@ -205,18 +225,20 @@ def main(argv: list[str] | None = None) -> int:
     # ── MIDI <-> audio temporal alignment ──
     # Both parse_midi and parse_audio assume time 0 in their file maps to beat 0 of the
     # song. If those don't actually line up musically, the MIDI's vote in the ensemble is
-    # systematically offset and gets diluted. Two ways to control:
-    #   - manual --midi-offset N (in beats) — overrides auto
-    #   - automatic first-onset alignment (default ON when both MIDI + an audio source exist)
+    # systematically offset and gets diluted. Three ways to control:
+    #   - manual --midi-offset N (in beats) — explicit
+    #   - --first-onset-align — auto-detect via first-note onsets
+    #   - --align-both — render BOTH raw and aligned variants side by side
+    applied_offset_beats: float | None = None
     if args.midi and "MIDI" in sources_named:
-        # pick whichever audio source path we have, in order of trustworthiness
+        # --align-both implies we need an offset to compare against
+        wants_align = args.first_onset_align or args.align_both or args.midi_offset is not None
         audio_for_align = (args.audio or args.basic_pitch
                            or args.autochord_path or args.chordino_path)
-        applied_offset_beats: float | None = None
         if args.midi_offset is not None:
             applied_offset_beats = args.midi_offset
             print(f"\nMIDI alignment: manual --midi-offset {args.midi_offset:+.2f} beats")
-        elif audio_for_align is not None and args.first_onset_align:
+        elif wants_align and audio_for_align is not None:
             bpm_for_align = args.bpm or sources_named["MIDI"].bpm
             result = compute_first_onset_offset_beats(args.midi, audio_for_align,
                                                       bpm=bpm_for_align)
@@ -224,26 +246,42 @@ def main(argv: list[str] | None = None) -> int:
                 offset, midi_t, audio_t = result
                 if abs(offset) >= 0.05:
                     applied_offset_beats = offset
-                    print(f"\nMIDI alignment: --first-onset-align shifted {offset:+.2f} beats "
+                    print(f"\nMIDI alignment: first-onset detected {offset:+.2f} beats shift "
                           f"(MIDI first note at {midi_t:.2f}s, audio first onset at {audio_t:.2f}s).")
                 else:
-                    print(f"\nMIDI alignment: --first-onset-align detected {offset:+.2f} beats "
-                          f"(within tolerance, no shift applied).")
+                    print(f"\nMIDI alignment: first-onset detected {offset:+.2f} beats "
+                          f"(within tolerance, no shift to apply).")
             else:
                 print("\nMIDI alignment: skipped (no onset detected in MIDI or audio).")
 
-        if applied_offset_beats is not None and applied_offset_beats != 0:
-            sources_named["MIDI"] = shift_sequence(sources_named["MIDI"], applied_offset_beats)
-            # rebuild the positional list so the ensemble vote sees the shifted MIDI
-            sources = list(sources_named.values())
-
-    # combine
-    if len(sources) == 1:
-        seq = sources[0]
+    # Build the per-alignment sources. We always produce a "raw" path; if an offset was
+    # found AND (--align-both or one of the alignment flags is set), we also produce an
+    # "aligned" path with the shifted MIDI.
+    if args.align_both and applied_offset_beats:
+        alignments = ["raw", "aligned"]
+    elif applied_offset_beats and (args.first_onset_align or args.midi_offset is not None):
+        alignments = ["aligned"]
     else:
-        seq = vote(*sources)
+        alignments = ["raw"]
+
+    seqs_per_alignment: dict[str, ChordSequence] = {}
+    for alignment in alignments:
+        if alignment == "aligned" and applied_offset_beats and "MIDI" in sources_named:
+            srcs = {**sources_named,
+                    "MIDI": shift_sequence(sources_named["MIDI"], applied_offset_beats)}
+        else:
+            srcs = sources_named
+        srcs_list = list(srcs.values())
+        if len(srcs_list) == 1:
+            seqs_per_alignment[alignment] = srcs_list[0]
+        else:
+            seqs_per_alignment[alignment] = vote(*srcs_list)
+
+    # disagreement + suggested-chart use the first alignment (the matrix shows both)
+    seq = seqs_per_alignment[alignments[0]]
+    if len(sources) > 1:
         if args.print_prog:
-            _print_progression("ENSEMBLE", seq)
+            _print_progression(f"ENSEMBLE ({alignments[0]})", seq)
         print_disagreement_report(sources_named)
 
     if args.suggest_chart:
@@ -276,8 +314,16 @@ def main(argv: list[str] | None = None) -> int:
         spice_values = [args.spice]
 
     base_path = args.out
-    bass_styles = ["none"] if args.no_bass else ["sustained", "walking"]
-    n_variants = len(spice_values) * len(voicings) * len(rhythms) * len(bass_styles)
+    if args.no_bass:
+        bass_styles = ["none"]
+    elif args.walking_bass:
+        bass_styles = ["sustained", "walking"]
+    else:
+        bass_styles = ["sustained"]
+    # piano_bass dimension: "off" = upright bass alone, "on" = piano LH doubles the bass
+    piano_bass_styles = ["off", "on"] if args.piano_bass else ["off"]
+    n_variants = (len(spice_values) * len(voicings) * len(rhythms)
+                  * len(bass_styles) * len(alignments) * len(piano_bass_styles))
     multi = n_variants > 1
 
     # ── compute the loudness envelope once if --follow-dynamics ──
@@ -296,54 +342,104 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(f"=== rendering matrix: {len(spice_values)} spice × {len(voicings)} voicing × "
-          f"{len(rhythms)} rhythm × {len(bass_styles)} bass = {n_variants} variants ===")
+          f"{len(rhythms)} rhythm × {len(bass_styles)} bass × {len(alignments)} alignment × "
+          f"{len(piano_bass_styles)} piano-bass = {n_variants} variants ===")
+
+    # the original chart-derived sequence for the explainer's "Original" column.
+    # Prefer the user's hand chart if provided; else fall back to the un-reharmonized
+    # ensemble vote at the first alignment.
+    original_seq = sources_named.get("CHART") or seqs_per_alignment[alignments[0]]
+
+    explainer_progressions: dict[str, list[dict]] = {}
+    explainer_voicings: dict[str, list[dict]] = {}
 
     matrix_cells: list[MatrixCell] = []
-    for spice in spice_values:
-        reharmed = reharmonize(seq, spice=spice, seed=args.seed)
-        if args.print_prog and len(spice_values) == 1:
-            _print_progression(f"REHARMONIZED (spice={spice})", reharmed)
+    for alignment in alignments:
+        seq_for_alignment = seqs_per_alignment[alignment]
+        for spice in spice_values:
+            reharmed = reharmonize(seq_for_alignment, spice=spice, seed=args.seed)
+            # capture the chord-comparison once per (spice, alignment)
+            prog_key = f"{spice:.2f}_{alignment}"
+            if prog_key not in explainer_progressions:
+                rows = chart_comparison(original_seq, reharmed)
+                explainer_progressions[prog_key] = [
+                    {"bar": r.bar, "beat": r.beat, "duration_beats": r.duration_beats,
+                     "original_symbol": r.original_symbol, "new_symbol": r.new_symbol,
+                     "new_bass": r.new_bass, "theory_note": r.theory_note}
+                    for r in rows
+                ]
+            # capture voicing breakdown once per (spice, alignment, voicing)
+            for voicing_style in voicings:
+                vkey = f"{spice:.2f}_{alignment}_{voicing_style}"
+                if vkey in explainer_voicings:
+                    continue
+                vbs = voicing_breakdown(reharmed, voicing_style)
+                explainer_voicings[vkey] = [
+                    {"chord_symbol": v.chord_symbol,
+                     "bass_pitch": v.bass_pitch,
+                     "bass_name": _midi_to_name(v.bass_pitch),
+                     "bass_interval": v.bass_interval,
+                     "intervals": list(v.intervals),
+                     "pitches": list(v.chord_pitches),
+                     "pitch_names": [_midi_to_name(p) for p in v.chord_pitches],
+                     "summary": v.summary}
+                    for v in vbs
+                ]
+            if (args.print_prog and len(spice_values) == 1 and len(alignments) == 1):
+                _print_progression(f"REHARMONIZED (spice={spice})", reharmed)
 
-        for voicing in voicings:
-            for rhythm in rhythms:
-                for bass_style in bass_styles:
-                    if multi:
-                        stem = base_path.stem
-                        spice_str = f"spice{int(round(spice * 100)):02d}"
-                        name_parts = [stem, spice_str, voicing]
-                        if len(rhythms) > 1:
-                            name_parts.append(rhythm)
-                        if bass_style != "none":
-                            name_parts.append(bass_style)
-                        midi_path = base_path.with_name(".".join(name_parts) + base_path.suffix)
-                    else:
-                        midi_path = base_path
+            for voicing in voicings:
+                for rhythm in rhythms:
+                    for bass_style in bass_styles:
+                        for pb_style in piano_bass_styles:
+                            if multi:
+                                stem = base_path.stem
+                                spice_str = f"spice{int(round(spice * 100)):02d}"
+                                name_parts = [stem, spice_str, voicing]
+                                if len(rhythms) > 1:
+                                    name_parts.append(rhythm)
+                                if bass_style != "none" and len(bass_styles) > 1:
+                                    name_parts.append(bass_style)
+                                elif bass_style == "none":
+                                    name_parts.append("nobass")
+                                if len(alignments) > 1:
+                                    name_parts.append(alignment)
+                                if len(piano_bass_styles) > 1:
+                                    name_parts.append("pianobass" if pb_style == "on" else "upright")
+                                midi_path = base_path.with_name(".".join(name_parts) + base_path.suffix)
+                            else:
+                                midi_path = base_path
 
-                    midi_out = write_midi(reharmed, midi_path, rhythm=rhythm,
-                                          include_bass=(bass_style != "none"), voicing=voicing,
-                                          walking_bass=(bass_style == "walking"),
-                                          dynamics_envelope=dynamics_env)
-                    tag = f"spice={spice:.2f} {voicing:<8} {rhythm:<13} {bass_style:<9}"
-                    print(f"[{tag}] MIDI: {midi_out}")
+                            midi_out = write_midi(
+                                reharmed, midi_path, rhythm=rhythm,
+                                include_bass=(bass_style != "none"), voicing=voicing,
+                                walking_bass=(bass_style == "walking"),
+                                dynamics_envelope=dynamics_env,
+                                piano_bass=(pb_style == "on"),
+                            )
+                            tag = (f"spice={spice:.2f} {voicing:<8} {rhythm:<13} "
+                                   f"{bass_style:<9} {alignment:<7} {pb_style:<3}")
+                            print(f"[{tag}] MIDI: {midi_out}")
 
-                    wav_out: Path | None = None
-                    mix_out: Path | None = None
-                    if args.render_audio or args.mix_with:
-                        wav_out = midi_out.with_suffix(".wav")
-                        render_midi_to_wav(midi_out, wav_out, soundfont_path=args.soundfont)
-                        print(f"[{tag}] WAV:  {wav_out}")
+                            wav_out: Path | None = None
+                            mix_out: Path | None = None
+                            if args.render_audio or args.mix_with:
+                                wav_out = midi_out.with_suffix(".wav")
+                                render_midi_to_wav(midi_out, wav_out, soundfont_path=args.soundfont)
+                                print(f"[{tag}] WAV:  {wav_out}")
 
-                        if args.mix_with and not args.html_report:
-                            mix_out = midi_out.with_suffix(".mix.wav")
-                            mix_audio(wav_out, args.mix_with, mix_out,
-                                      comp_gain_db=args.comp_gain_db,
-                                      original_gain_db=args.song_gain_db)
-                            print(f"[{tag}] MIX:  {mix_out}")
+                                if args.mix_with and not args.html_report:
+                                    mix_out = midi_out.with_suffix(".mix.wav")
+                                    mix_audio(wav_out, args.mix_with, mix_out,
+                                              comp_gain_db=args.comp_gain_db,
+                                              original_gain_db=args.song_gain_db)
+                                    print(f"[{tag}] MIX:  {mix_out}")
 
-                    matrix_cells.append(MatrixCell(
-                        spice=spice, voicing=voicing, rhythm=rhythm, bass=bass_style,
-                        midi_path=midi_out, wav_path=wav_out, mix_path=mix_out,
-                    ))
+                            matrix_cells.append(MatrixCell(
+                                spice=spice, voicing=voicing, rhythm=rhythm, bass=bass_style,
+                                alignment=alignment, piano_bass=pb_style,
+                                midi_path=midi_out, wav_path=wav_out, mix_path=mix_out,
+                            ))
 
     if args.html_report:
         hand_text = args.chart.read_text() if args.chart else None
@@ -359,6 +455,10 @@ def main(argv: list[str] | None = None) -> int:
             suggested_chart_text=suggested_text,
             original_audio_path=args.mix_with,
             duck_hpf_hz=args.duck_hz,
+            explainer_data={
+                "progressions": explainer_progressions,
+                "voicings": explainer_voicings,
+            },
         )
         print(f"\nwrote HTML report: {report_path}")
 

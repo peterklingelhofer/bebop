@@ -2,8 +2,11 @@
 
 We emit two instrument tracks:
     - "Comp Bass":  GM program 33 (Acoustic Bass), either one sustained note per
-                    chord (default) or a quarter-note walking line.
-    - "Comp Piano": GM program 1 (Acoustic Grand Piano), the rhythmic upper-structure voicings.
+                    chord (default) or a quarter-note walking line. Empty when
+                    `piano_bass=True` because the piano takes over the bassline.
+    - "Comp Piano": GM program 1 (Acoustic Grand Piano), the rhythmic upper-structure
+                    voicings, plus the bassline in the LH register when
+                    `piano_bass=True` (for the solo-piano feel).
 """
 
 from __future__ import annotations
@@ -35,11 +38,16 @@ def write_midi(
     voicing: str = "rootless",
     walking_bass: bool = False,
     dynamics_envelope: list[float] | None = None,
+    piano_bass: bool = False,
 ) -> Path:
     """Render a comping MIDI file from a (reharmonized) ChordSequence.
 
     `voicing` chooses the piano voicing style: rootless, evans, drop2, quartal.
-    `walking_bass`: if True, emit quarter-note walking bass instead of sustained roots.
+    `walking_bass`: if True, the bassline is a quarter-note walking line; else
+        sustained roots.
+    `piano_bass`: if True, the piano carries the bassline (LH) and the bass
+        instrument is silent. If False, the bass instrument plays the bassline
+        and the piano only plays chord voicings.
     """
     pm = pretty_midi.PrettyMIDI(initial_tempo=seq.bpm)
     seconds_per_beat = 60.0 / seq.bpm
@@ -50,11 +58,17 @@ def write_midi(
         name=f"Comp Bass{' (walking)' if walking_bass else ''}",
     )
 
-    # ── bass track ──
-    if include_bass:
+    # ── decide who carries the bassline ──
+    bass_to_track = bass if (include_bass and not piano_bass) else (piano if (include_bass and piano_bass) else None)
+    # bass_to_track is the instrument that gets the bassline notes:
+    #   include_bass=False           → None (no bassline at all)
+    #   include_bass + piano_bass=F  → bass instrument (default; full trio)
+    #   include_bass + piano_bass=T  → piano (solo-piano feel; bass instrument empty)
+
+    if bass_to_track is not None:
         if walking_bass:
             for note in walking_bass_line(seq):
-                bass.notes.append(pretty_midi.Note(
+                bass_to_track.notes.append(pretty_midi.Note(
                     velocity=_vel(note.velocity, dynamics_envelope, note.start_beat),
                     pitch=note.pitch,
                     start=note.start_beat * seconds_per_beat,
@@ -64,7 +78,7 @@ def write_midi(
             for chord in seq.chords:
                 v = voice_chord(chord, previous=None, style=voicing)
                 start = chord.start_beat * seconds_per_beat
-                bass.notes.append(pretty_midi.Note(
+                bass_to_track.notes.append(pretty_midi.Note(
                     velocity=_vel(80, dynamics_envelope, chord.start_beat),
                     pitch=v.bass_pitch,
                     start=start,

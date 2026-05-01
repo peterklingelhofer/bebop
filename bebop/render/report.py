@@ -19,13 +19,20 @@ from __future__ import annotations
 
 import difflib
 import html as html_lib
+import json
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from bebop.io.disagreement import disagreement_table
+from bebop.render.explainer import (
+    ChartRow,
+    VoicingBreakdown,
+    chart_comparison,
+    voicing_breakdown,
+)
 from bebop.types import ChordSequence
 
 
@@ -40,6 +47,8 @@ class MatrixCell:
     voicing: str
     bass: str                  # "sustained" or "walking" (or "none" for --no-bass)
     rhythm: str = "charleston" # one of charleston, two_and_four, sustained, anticipations
+    alignment: str = "raw"     # "raw" or "aligned" — present when --align-both is on
+    piano_bass: str = "off"    # "off" (upright only) or "on" (piano LH doubles bass)
     midi_path: Path = Path()
     wav_path: Path | None = None
     mix_path: Path | None = None  # legacy; HTML mixer renders in-browser instead
@@ -138,6 +147,64 @@ tr:hover { background: #fafbfc; }
 .legend { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center;
           font-size: 0.8rem; margin: 0.5rem 0 1rem 0; }
 .legend span { padding: 0.2rem 0.6rem; border-radius: 4px; }
+
+.chart-btn {
+    margin-top: 0.3rem;
+    padding: 0.25rem 0.5rem;
+    font-size: 0.7rem; font-weight: 500;
+    background: #f3f4f6; color: #444; border: 1px solid #d1d5db; border-radius: 4px;
+    cursor: pointer; width: 100%;
+}
+.chart-btn:hover { background: #e5e7eb; }
+
+.modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: none; align-items: flex-start; justify-content: center;
+    z-index: 100; padding: 4vh 2vw;
+}
+.modal-backdrop.open { display: flex; }
+.modal-content {
+    background: #fff; border-radius: 10px; padding: 1.4rem 1.6rem;
+    max-width: 1100px; width: 100%; max-height: 92vh; overflow-y: auto;
+    box-shadow: 0 18px 36px rgba(0,0,0,0.25);
+    font-size: 0.85rem;
+}
+.modal-header { display: flex; justify-content: space-between; align-items: baseline;
+                gap: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #eee;
+                margin-bottom: 0.8rem; }
+.modal-header h3 { margin: 0; font-size: 1.05rem; }
+.modal-close { background: transparent; border: none; font-size: 1.6rem; line-height: 1;
+               cursor: pointer; color: #888; padding: 0; }
+.modal-close:hover { color: #222; }
+
+.chord-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.chord-table th { background: #f7f7f9; text-align: left; padding: 0.4rem 0.6rem;
+                  border-bottom: 2px solid #e5e7eb; position: sticky; top: 0; }
+.chord-table td { padding: 0.35rem 0.6rem; border-bottom: 1px solid #f0f0f0;
+                  vertical-align: top; }
+.chord-table tr:hover { background: #fafbfc; }
+.chord-table tr.now-playing {
+    background: #fff3b0;
+    box-shadow: inset 4px 0 0 #d4a017;
+}
+.chord-table tr.now-playing td { font-weight: 600; }
+.chord-table .col-bar { color: #888; font-variant-numeric: tabular-nums; width: 4em; }
+.chord-table .col-original { color: #666; width: 7em; }
+.chord-table .col-new { font-weight: 600; width: 9em; }
+.chord-table .col-note { color: #555; font-style: italic; font-size: 0.8rem; }
+.chord-table .col-voicing { color: #444; font-family: 'SF Mono', Menlo, monospace;
+                            font-size: 0.78rem; white-space: nowrap; }
+.voicing-summary { color: #666; font-style: italic; margin-bottom: 0.2rem;
+                   font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+                   font-size: 0.75rem; }
+.voicing-notes { display: grid; grid-template-columns: auto auto 1fr; gap: 0.2rem 0.6rem;
+                 align-items: baseline; }
+.voicing-notes .pitch { font-weight: 600; color: #222; }
+.voicing-notes .role  { color: #b35; font-size: 0.7rem; text-transform: uppercase;
+                        letter-spacing: 0.4px; }
+.voicing-notes .iv    { color: #555; }
+.voicing-notes .bass-row .pitch { color: #1a4d8f; }   /* bass note in blue */
+.voicing-notes .bass-row .role  { color: #1a4d8f; }
 """
 
 _JS = """
@@ -256,6 +323,147 @@ _JS = """
         apply(parseFloat(slider.value));
         slider.addEventListener('input', e => apply(parseFloat(e.target.value)));
     });
+
+    // ─── chord-chart modal + theory popup ───
+    const modal = document.getElementById('chord-modal');
+    const modalBody = document.getElementById('modal-body');
+    const modalTitle = document.getElementById('modal-title');
+    const modalClose = document.querySelector('.modal-close');
+    let highlightFrame = null;
+    let modalRows = [];      // current modal's row elements with .data-end-beat etc.
+
+    const closeModal = () => {
+        if (!modal) return;
+        modal.classList.remove('open');
+        if (highlightFrame) cancelAnimationFrame(highlightFrame);
+        highlightFrame = null;
+        modalRows.forEach(r => r.classList.remove('now-playing'));
+        modalRows = [];
+    };
+    if (modalClose) modalClose.addEventListener('click', closeModal);
+    if (modal) modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(); });
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModal(); });
+
+    const data = window._bebopExplainer || null;
+
+    // Pick whichever audio element is currently playing (in priority: original,
+    // then the active comp, then any comp-only scrub player). Returns {audio, source}.
+    const findPlayingAudio = () => {
+        if (!original.paused) return { audio: original, source: 'original' };
+        if (activeCellId) {
+            const comp = document.querySelector(`audio.comp[data-id="${activeCellId}"]`);
+            if (comp && !comp.paused) return { audio: comp, source: 'comp' };
+        }
+        // fallback: any <audio controls> that's currently playing (scrub player)
+        for (const a of document.querySelectorAll('audio[controls]')) {
+            if (!a.paused) return { audio: a, source: 'scrub' };
+        }
+        return null;
+    };
+
+    const startHighlightLoop = (bpm) => {
+        if (highlightFrame) cancelAnimationFrame(highlightFrame);
+        let lastIdx = -1;
+        const tick = () => {
+            if (!modal.classList.contains('open')) return;
+            const playing = findPlayingAudio();
+            let idx = -1;
+            if (playing) {
+                const beat = playing.audio.currentTime * bpm / 60;
+                // find row whose [start_beat, end_beat) contains this beat
+                for (let i = 0; i < modalRows.length; i++) {
+                    const sb = parseFloat(modalRows[i].dataset.startBeat);
+                    const eb = parseFloat(modalRows[i].dataset.endBeat);
+                    if (beat >= sb && beat < eb) { idx = i; break; }
+                }
+            }
+            if (idx !== lastIdx) {
+                modalRows.forEach(r => r.classList.remove('now-playing'));
+                if (idx >= 0) {
+                    modalRows[idx].classList.add('now-playing');
+                    // scroll into view (within the modal body)
+                    const el = modalRows[idx];
+                    const container = el.closest('.modal-content');
+                    const elTop = el.offsetTop;
+                    const containerTop = container.scrollTop;
+                    const containerH = container.clientHeight;
+                    if (elTop < containerTop + 80 || elTop > containerTop + containerH - 100) {
+                        container.scrollTo({ top: elTop - containerH / 2, behavior: 'smooth' });
+                    }
+                }
+                lastIdx = idx;
+            }
+            highlightFrame = requestAnimationFrame(tick);
+        };
+        highlightFrame = requestAnimationFrame(tick);
+    };
+
+    const openChartFor = (progressionId, voicingId, label) => {
+        if (!data || !modal) return;
+        const progression = data.progressions[progressionId] || [];
+        const voicings = data.voicings[voicingId] || [];
+        modalTitle.textContent = label;
+
+        const rows = progression.map((row, i) => {
+            const v = voicings[i] || null;
+            const orig = row.original_symbol || '<span style="color:#bbb">(inserted)</span>';
+            const newSym = row.new_symbol + (row.new_bass ? '/' + row.new_bass : '');
+            const note = row.theory_note || '';
+            let voicingCell = '';
+            if (v) {
+                // Render every sounding note: bass first, then chord-voicing pitches
+                // top-to-bottom from low to high. Each row shows pitch · role · interval.
+                const rhRows = (v.pitches || []).map((midi, idx) => {
+                    return `
+                        <div class="pitch">${v.pitch_names[idx]}</div>
+                        <div class="role">RH</div>
+                        <div class="iv">${v.intervals[idx]}</div>
+                    `;
+                }).join('');
+                const bassRow = (v.bass_name) ? `
+                    <div class="bass-row pitch">${v.bass_name}</div>
+                    <div class="bass-row role">bass</div>
+                    <div class="bass-row iv">${v.bass_interval}</div>
+                ` : '';
+                voicingCell = `
+                    <div class="voicing-summary">${v.summary || ''}</div>
+                    <div class="voicing-notes">${bassRow}${rhRows}</div>
+                `;
+            }
+            const endBeat = row.beat + row.duration_beats;
+            return `
+                <tr data-start-beat="${row.beat}" data-end-beat="${endBeat}">
+                    <td class="col-bar">${row.bar} (${row.duration_beats}b)</td>
+                    <td class="col-original">${orig}</td>
+                    <td class="col-new">${newSym}</td>
+                    <td class="col-note">${note}</td>
+                    <td class="col-voicing">${voicingCell}</td>
+                </tr>`;
+        }).join('');
+
+        modalBody.innerHTML = `
+            <table class="chord-table">
+                <thead><tr>
+                    <th>Bar</th>
+                    <th>Original</th>
+                    <th>This variant</th>
+                    <th>What changed</th>
+                    <th>Voicing</th>
+                </tr></thead>
+                <tbody>${rows}</tbody>
+            </table>`;
+        modalRows = Array.from(modalBody.querySelectorAll('tbody tr'));
+        modal.classList.add('open');
+        startHighlightLoop(data.bpm);
+    };
+
+    document.querySelectorAll('button.chart-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            openChartFor(btn.dataset.progressionId,
+                         btn.dataset.voicingId,
+                         btn.dataset.label);
+        });
+    });
 })();
 """
 
@@ -284,16 +492,30 @@ def _render_diff(hand: str, suggested: str) -> str:
 
 def _render_bass_variant(c: MatrixCell, report_dir: Path,
                          has_original: bool, default_comp_vol: float,
-                         show_rhythm: bool) -> str:
-    """Render one (rhythm, bass) sub-variant inside a (spice, voicing) cell."""
-    cell_id = f"sp{int(round(c.spice * 100)):02d}_{c.voicing}_{c.rhythm}_{c.bass}"
+                         show_rhythm: bool, show_alignment: bool,
+                         show_piano_bass: bool) -> str:
+    """Render one (rhythm, bass[, alignment][, piano_bass]) sub-variant inside a cell."""
+    cell_id = (f"sp{int(round(c.spice * 100)):02d}_{c.voicing}_{c.rhythm}_"
+               f"{c.bass}_{c.alignment}_pb{c.piano_bass}")
     label_parts = [f"spice {c.spice:.1f}", c.voicing]
     if show_rhythm:
         label_parts.append(c.rhythm)
     label_parts.append(f"{c.bass} bass")
+    if show_alignment:
+        label_parts.append(f"{c.alignment} timing")
+    if show_piano_bass:
+        label_parts.append("bass on piano" if c.piano_bass == "on" else "bass on upright")
     label = " / ".join(label_parts)
 
-    sub_label = (f"{c.rhythm} · {c.bass} bass" if show_rhythm else f"{c.bass} bass")
+    sub_parts = []
+    if show_rhythm:
+        sub_parts.append(c.rhythm)
+    sub_parts.append(f"{c.bass} bass")
+    if show_alignment:
+        sub_parts.append(f"{c.alignment} timing")
+    if show_piano_bass:
+        sub_parts.append("bass on piano" if c.piano_bass == "on" else "bass on upright")
+    sub_label = " · ".join(sub_parts) if sub_parts else f"{c.bass} bass"
 
     parts: list[str] = [f'<div class="bass-variant" data-id="{cell_id}" '
                         f'data-label="{html_lib.escape(label)}">']
@@ -323,6 +545,14 @@ def _render_bass_variant(c: MatrixCell, report_dir: Path,
     rel_midi = _relpath(c.midi_path, report_dir)
     parts.append(f'<div class="label" style="margin-top: 0.3rem;">'
                  f'<a href="{rel_midi}">download .mid</a></div>')
+    # chord-chart explainer button — shows reharm + voicing breakdown in a modal
+    progression_id = f"{c.spice:.2f}_{c.alignment}"
+    voicing_id = f"{c.spice:.2f}_{c.alignment}_{c.voicing}"
+    parts.append(
+        f'<button class="chart-btn" data-progression-id="{progression_id}" '
+        f'data-voicing-id="{voicing_id}" data-label="{html_lib.escape(label)}">'
+        f'📋 Chord chart + theory</button>'
+    )
     parts.append('</div>')
     return "".join(parts)
 
@@ -332,16 +562,25 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
     spices = sorted({c.spice for c in cells})
     voicings = sorted({c.voicing for c in cells})
     rhythms = sorted({c.rhythm for c in cells})
+    alignments = sorted({c.alignment for c in cells})
+    piano_bass_styles = sorted({c.piano_bass for c in cells})
     show_rhythm = len(rhythms) > 1
+    show_alignment = len(alignments) > 1
+    show_piano_bass = len(piano_bass_styles) > 1
     groups: dict[tuple[float, str], list[MatrixCell]] = {}
     for c in cells:
         groups.setdefault((c.spice, c.voicing), []).append(c)
     bass_order = {"sustained": 0, "walking": 1, "none": 2}
     rhythm_order = {r: i for i, r in enumerate(rhythms)}
+    alignment_order = {"raw": 0, "aligned": 1}
+    pb_order = {"off": 0, "on": 1}
     for grp in groups.values():
-        # within a (spice, voicing) cell, group by rhythm then bass
-        grp.sort(key=lambda c: (rhythm_order.get(c.rhythm, 99),
-                                bass_order.get(c.bass, 99)))
+        # within a cell: alignment → rhythm → bass → piano_bass (so adjacent rows differ
+        # only by piano_bass, making the comparison ergonomic)
+        grp.sort(key=lambda c: (alignment_order.get(c.alignment, 99),
+                                rhythm_order.get(c.rhythm, 99),
+                                bass_order.get(c.bass, 99),
+                                pb_order.get(c.piano_bass, 99)))
 
     out: list[str] = []
     out.append('<div class="matrix" style="grid-template-columns: 6em '
@@ -364,7 +603,9 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
             html_parts = ['<div class="matrix-cell">']
             for c in grp:
                 html_parts.append(_render_bass_variant(c, report_dir, has_original,
-                                                       default_comp_vol, show_rhythm))
+                                                       default_comp_vol,
+                                                       show_rhythm, show_alignment,
+                                                       show_piano_bass))
             html_parts.append('</div>')
             out.append("".join(html_parts))
     out.append('</div>')
@@ -449,6 +690,7 @@ def write_html_report(
     default_original_vol: float = 0.7,
     default_comp_vol: float = 0.35,
     duck_hpf_hz: int = _DEFAULT_DUCK_HPF_HZ,
+    explainer_data: dict | None = None,
 ) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,6 +757,23 @@ def write_html_report(
         parts.append('<p class="meta">Lines in red are in your hand chart but not the suggestion. '
                      'Lines in green are the ensemble&rsquo;s additions.</p>')
         parts.append(f'<pre class="diff-pre">{_render_diff(hand_chart_text, suggested_chart_text)}</pre>')
+
+    # ── chord-chart explainer modal + injected data ──
+    parts.append('<div id="chord-modal" class="modal-backdrop">')
+    parts.append('  <div class="modal-content">')
+    parts.append('    <div class="modal-header">')
+    parts.append('      <h3 id="modal-title">chord chart</h3>')
+    parts.append('      <button class="modal-close" aria-label="close">×</button>')
+    parts.append('    </div>')
+    parts.append('    <div id="modal-body"></div>')
+    parts.append('  </div>')
+    parts.append('</div>')
+
+    if explainer_data is not None:
+        injected = json.dumps({"bpm": bpm, **explainer_data}, separators=(",", ":"))
+    else:
+        injected = json.dumps({"bpm": bpm, "progressions": {}, "voicings": {}})
+    parts.append(f'<script>window._bebopExplainer = {injected};</script>')
 
     parts.append(f'<script>{_JS}</script>')
     parts.append('</body></html>')
