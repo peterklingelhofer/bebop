@@ -497,7 +497,7 @@ def _render_bass_variant(c: MatrixCell, report_dir: Path,
     """Render one (rhythm, bass[, alignment][, piano_bass]) sub-variant inside a cell."""
     cell_id = (f"sp{int(round(c.spice * 100)):02d}_{c.voicing}_{c.rhythm}_"
                f"{c.bass}_{c.alignment}_pb{c.piano_bass}")
-    label_parts = [f"spice {c.spice:.1f}", c.voicing]
+    label_parts = [f"spice {c.spice:.2f}", c.voicing]
     if show_rhythm:
         label_parts.append(c.rhythm)
     label_parts.append(f"{c.bass} bass")
@@ -594,7 +594,7 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
     for sp in spices:
         out.append(f'<div class="matrix-cell" style="background: #efefef; '
                    f'display: flex; align-items: center; justify-content: center;">'
-                   f'<strong>spice {sp:.1f}</strong></div>')
+                   f'<strong>spice {sp:.2f}</strong></div>')
         for v in voicings:
             grp = groups.get((sp, v))
             if not grp:

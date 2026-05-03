@@ -131,11 +131,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Also render quarter-note walking bass alongside the default "
                              "sustained-root bass, so each cell has both for comparison. "
                              "Default: only sustained-root bass.")
-    parser.add_argument("--piano-bass", action="store_true",
-                        help="Also render variants where the piano doubles the bass line "
-                             "(LH bass at ~85%% of bass velocity), alongside the default "
-                             "upright-bass-only variants. Each cell in the matrix gets both "
-                             "for A/B. Doubles the variant count.")
+    parser.add_argument("--bass-mode", choices=["upright", "piano", "both"],
+                        default="upright",
+                        help="Who plays the bassline:\n"
+                             "  upright (default): the bass instrument plays it; piano is just chords.\n"
+                             "  piano: the piano LH plays it; bass instrument is silent (solo-piano feel).\n"
+                             "  both: render both variants for A/B comparison (doubles variant count).")
     parser.add_argument("--follow-dynamics", action="store_true",
                         help="Scale comp note velocities by the audio's RMS loudness envelope so "
                              "the comp swells with the song instead of playing flat. Off by default. "
@@ -320,8 +321,16 @@ def main(argv: list[str] | None = None) -> int:
         bass_styles = ["sustained", "walking"]
     else:
         bass_styles = ["sustained"]
-    # piano_bass dimension: "off" = upright bass alone, "on" = piano LH doubles the bass
-    piano_bass_styles = ["off", "on"] if args.piano_bass else ["off"]
+    # piano_bass dimension drives who plays the bassline:
+    #   "off" → upright instrument; "on" → piano LH (upright silent)
+    if args.no_bass:
+        piano_bass_styles = ["off"]
+    elif args.bass_mode == "upright":
+        piano_bass_styles = ["off"]
+    elif args.bass_mode == "piano":
+        piano_bass_styles = ["on"]
+    else:   # "both"
+        piano_bass_styles = ["off", "on"]
     n_variants = (len(spice_values) * len(voicings) * len(rhythms)
                   * len(bass_styles) * len(alignments) * len(piano_bass_styles))
     multi = n_variants > 1
