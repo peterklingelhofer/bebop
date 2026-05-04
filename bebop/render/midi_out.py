@@ -39,6 +39,7 @@ def write_midi(
     walking_bass: bool = False,
     dynamics_envelope: list[float] | None = None,
     piano_bass: bool = False,
+    global_shift_beats: float = 0.0,
 ) -> Path:
     """Render a comping MIDI file from a (reharmonized) ChordSequence.
 
@@ -48,15 +49,21 @@ def write_midi(
     `piano_bass`: if True, the piano carries the bassline (LH) and the bass
         instrument is silent. If False, the bass instrument plays the bassline
         and the piano only plays chord voicings.
+    `global_shift_beats`: shift every emitted note by this many beats AFTER all
+        rendering is done. Positive values delay the comp (makes the song hear
+        the comp's "earlier" content); negative values would push notes to
+        negative time and get clipped. Used by the `charleston_+N` rhythm
+        variants to replicate the dragged-region-in-Logic effect.
     """
     pm = pretty_midi.PrettyMIDI(initial_tempo=seq.bpm)
     seconds_per_beat = 60.0 / seq.bpm
 
-    piano = pretty_midi.Instrument(program=0, name=f"Comp Piano ({voicing})")
-    bass = pretty_midi.Instrument(
-        program=32,
-        name=f"Comp Bass{' (walking)' if walking_bass else ''}",
-    )
+    # Track names include the full output stem so when the MIDI gets dragged into
+    # a DAW (Logic, etc.), each track header tells you exactly which variant it is —
+    # e.g. "Piano · noacoustic_matrix.spice00.rootless.charleston_+1".
+    variant_id = Path(output_path).stem
+    piano = pretty_midi.Instrument(program=0, name=f"Piano · {variant_id}")
+    bass = pretty_midi.Instrument(program=32, name=f"Bass · {variant_id}")
 
     # ── decide who carries the bassline ──
     bass_to_track = bass if (include_bass and not piano_bass) else (piano if (include_bass and piano_bass) else None)
@@ -107,6 +114,18 @@ def write_midi(
 
     pm.instruments.append(bass)
     pm.instruments.append(piano)
+
+    # Apply global time shift LAST so it covers every note from every track.
+    # Notes that would land at negative time get clipped to t=0; positive shifts
+    # naturally produce silence at the start of the rendered WAV.
+    if global_shift_beats != 0:
+        shift_seconds = global_shift_beats * seconds_per_beat
+        for inst in pm.instruments:
+            for note in inst.notes:
+                note.start = max(0.0, note.start + shift_seconds)
+                note.end = max(0.0, note.end + shift_seconds)
+            # remove zero-duration notes that got fully clipped
+            inst.notes = [n for n in inst.notes if n.end > n.start]
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

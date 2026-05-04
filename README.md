@@ -105,6 +105,18 @@ bebop --chart charts/song.txt --bpm 94 \
 # 2 spice × 2 voicings × 2 rhythms × 2 bass styles = 16 variants in the matrix
 ```
 
+### A/B all four Charleston shifts at once
+
+```bash
+bebop --chart charts/song.txt --bpm 94 --spice 0 \
+      --voicings rootless,evans \
+      --rhythms charleston,charleston_+1,charleston_+2,charleston_+3 \
+      --bass-mode piano --follow-dynamics \
+      --html-report output/charleston_shifts.html \
+      --out output/cs.mid --render-audio --mix-with audio/song.wav
+# Same chord progression, same voicing — just rotate the Charleston by 1, 2, 3 beats
+```
+
 ### Make the comp swell with the song
 
 ```bash
@@ -115,6 +127,27 @@ bebop --chart charts/song.txt \
       --out output/dynamic.mid --render-audio \
       --mix-with 'audio/song.wav'
 # velocity scales 0.55× (quiet) to 1.20× (loud) following the audio's RMS envelope
+```
+
+### Maximum-comparison A/B grid: every axis side-by-side
+
+```bash
+bebop --chart charts/butterfly_boy.txt \
+      --midi 'audio/butterfly boy acoustic guitar MIDI.midi' \
+      --audio 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+      --basic-pitch 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+      --autochord 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+      --chordino 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+      --bpm 94 \
+      --spice-sweep '0.0,0.01' \
+      --voicings rootless,evans,drop2,quartal \
+      --rhythms charleston,two_and_four,sustained,anticipations \
+      --walking-bass --align-both --bass-mode both --follow-dynamics \
+      --html-report output/butterfly_boy.html \
+      --out output/matrix.mid --render-audio \
+      --mix-with 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav'
+# 2 spice × 4 voicing × 4 rhythm × 2 bass × 2 alignment × 2 bass-mode = 256 variants
+# every cell A/B's all six axes for direct comparison
 ```
 
 ### A/B with the original in the browser
@@ -144,23 +177,45 @@ HPF version while preserving playback position — so you can flip on the fly to
 hear the comp's bass cut through the song. No Web Audio, no local server, no
 CORS issues.
 
+## Butterfly boy reference command
+
+Preferred config for the bundled `audio/butterfly boy ...` files — piano
+carries the bass (no upright; cleanest sound on this song), sustained bass
+only (no walking), and the MIDI / WAV are time-locked to the first downbeat
+so no alignment correction is needed:
+
 ```bash
 PATH="/opt/homebrew/bin:$PATH" ~/.local/bin/uv run bebop \
   --chart charts/butterfly_boy.txt \
-  --midi 'audio/butterfly boy acoustic guitar MIDI.midi' \
-  --audio 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
-  --basic-pitch 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
-  --autochord 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
-  --chordino 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav' \
+  --midi 'audio/butterfly boy acoustic guitar midi 94 bpm locked to 1st downbeat.mid' \
+  --audio 'audio/butterfly boy no acoustic guitar 20260502.wav' \
+  --basic-pitch 'audio/butterfly boy no acoustic guitar 20260502.wav' \
+  --autochord 'audio/butterfly boy no acoustic guitar 20260502.wav' \
+  --chordino 'audio/butterfly boy no acoustic guitar 20260502.wav' \
   --bpm 94 \
-  --spice-sweep '0.0,0.3,0.5,0.7,0.9' \
+  --spice-sweep '0.0,0.01' \
   --voicings rootless,evans,drop2,quartal \
+  --rhythms charleston,two_and_four,sustained,anticipations \
+  --bass-mode piano \
+  --follow-dynamics \
+  --duck-hz 200 \
   --suggest-chart charts/butterfly_boy.suggested.txt \
   --html-report output/butterfly_boy.html \
   --out output/matrix.mid \
   --render-audio \
-  --mix-with 'audio/butterfly boy 20260330 no acoustic guitar 94bpm.wav'
+  --mix-with 'audio/butterfly boy no acoustic guitar 20260502.wav'
 ```
+
+→ 2 spice × 4 voicing × 4 rhythm × 1 bass × 1 bass-mode = **32 variants**, ~4 min render
+(plus first-time chord-recognizer cost on the new audio: ~1 min).
+
+Other flags you can mix in:
+- `--walking-bass` — also render walking-bass quarter-note lines (doubles the count)
+- `--bass-mode both` — render both upright-only AND piano-bass variants for A/B
+- `--bass-mode upright` — keep the bassline on the upright (default if `--bass-mode` is omitted)
+- `--first-onset-align` — auto-detect first-onset offset between MIDI and WAV. Off by default; only useful if your MIDI and WAV don't share the same downbeat
+- `--align-both` — render every variant twice, once raw and once with first-onset alignment, for A/B
+- Wider `--spice-sweep` — try `'0.0,0.3,0.5,0.7'` for a fuller spice spread
 
 ## Chord chart format
 
@@ -211,9 +266,28 @@ is two beats each in 4/4.
 | Flag | Default | What it does |
 |---|---|---|
 | `--voicings rootless,evans,drop2,quartal` | all four | Comma-separated voicing styles. Each emits its own MIDI/WAV. `rootless` = bass + 3-7-9 shell, `evans` = full Bill Evans LH+RH, `drop2` = 4-note close with 2nd-from-top dropped an octave, `quartal` = stacked 4ths (McCoy Tyner) |
-| `--rhythm STYLE` | `charleston` | Single rhythm template. One of `charleston` (beat 1 + "and" of 3), `two_and_four` (Freddie Green chunk), `sustained` (whole-bar pad), `anticipations` (push on "and" of 4) |
-| `--rhythms "a,b,c"` | (uses `--rhythm`) | Comma-separated rhythm sweep. Each rhythm × voicing × spice × bass becomes its own matrix variant. e.g. `--rhythms charleston,anticipations` doubles the matrix file count |
-| `--no-bass` | (off) | Skip the bass track entirely. By default, every variant in the matrix is rendered **twice** — once with sustained-root bass, once with quarter-note walking bass — so you can compare both. Walking bass plays beat 1 root, beat 2 fifth, beat 3 third, last beat chromatic approach to the next chord's root |
+| `--rhythm STYLE` | `charleston` | Single rhythm template. See full list below |
+| `--rhythms "a,b,c"` | (uses `--rhythm`) | Comma-separated rhythm sweep. Each rhythm × voicing × spice × bass becomes its own matrix variant |
+
+#### Available rhythm templates
+
+| name | hits within a 4-beat bar | character |
+|---|---|---|
+| `charleston` | 1 + "and of 3" | the classic; downbeat plus syncopated push |
+| `charleston_+1` | 2 + "and of 4" | shifted +1 beat; landed on 2 with a strong push into next bar |
+| `charleston_+2` | "and of 1" + 3 | shifted +2 beats; answers the original Charleston |
+| `charleston_+3` | "and of 2" + 4 | shifted +3 beats; late and pushy |
+| `two_and_four` | 2 + 4 | Freddie Green chunk minus the downbeats |
+| `freddie_green` | 1 + 2 + 3 + 4 (2 and 4 emphasized) | full Count Basie back-beat-emphasized quarter chunk |
+| `sustained` | held for the whole bar | one chord per bar; ballad pad |
+| `anticipations` | 1 + 3 + "and of 4" | forward-leaning, the "and of 4" pushes into the next bar |
+| `reverse_charleston` | "and of 1" + 3 | call-and-response answer to Charleston |
+| `ahmad_jamal` | 1 + 2 + "and of 3" | front-loaded then a syncopated push |
+| `bossa` | 1 + "and of 2" + 4 | latin-flavored 3-2 clave shape |
+| `kenny_barron` | 1 + "and of 2" + 4 (dotted-quarter pulses) | 3-against-4 polyrhythmic feel |
+| `--no-bass` | (off) | Skip the bass track entirely. |
+| `--walking-bass` | (off) | Also render quarter-note walking bass alongside the default sustained-root bass, so each cell has both for A/B. Walking bass plays beat 1 root, beat 2 fifth, beat 3 third, last beat chromatic approach to the next chord's root. Doubles the variant count |
+| `--bass-mode {upright,piano,both}` | `upright` | Who plays the bassline. `upright` (default): bass instrument plays it, piano just does chords. `piano`: piano LH plays it, upright is silent (solo-piano feel). `both`: render both variants per cell for A/B (doubles variant count) |
 | `--follow-dynamics` | (off) | Scale comp note velocities by the audio's RMS loudness envelope so the comp swells with the song instead of playing flat. Computed from `--mix-with` (or any audio source). Range: 0.55× quiet → 1.20× loud, smoothed across 2 beats so phrases breathe rather than each note jumping |
 | `--bpm FLOAT` | from input | Override BPM. Required for `--audio`/`--basic-pitch`/`--autochord`/`--chordino` if no chart provides a bpm |
 
@@ -223,6 +297,7 @@ is two beats each in 4/4.
 |---|---|---|
 | `--midi-offset BEATS` | (off) | Manual MIDI shift in beats. Positive = MIDI later. Overrides `--first-onset-align` |
 | `--first-onset-align` | off | Auto-align MIDI to audio by detecting first onset in each. Only useful when MIDI was transcribed directly from the WAV (so they share t=0). For separated-stem workflows, leave off |
+| `--align-both` | off | Render every variant **twice** — once with raw MIDI timing, once with first-onset alignment applied — so you can A/B them in the matrix. Implies `--first-onset-align` if no `--midi-offset` is given. Doubles the variant count |
 
 ### Output
 
@@ -241,7 +316,7 @@ is two beats each in 4/4.
 |---|---|
 | `--print` | Print every input source's chord progression and the ensemble consensus to stdout, plus a disagreement report sorted by noisiest bars first |
 | `--suggest-chart PATH` | Write the ensemble consensus as a Real Book-style chord chart you can audit, diff, and edit. Then re-run with that file as `--chart` |
-| `--html-report PATH` | Write a single-page HTML audit. Embeds the original audio, every variant as `<audio>` players, a per-cell mixer with comp volume sliders, a **duck song bass** toggle (swaps in a pre-rendered HPF version of the song so the comp's bass cuts through; cutoff via `--duck-hz`), the disagreement table color-coded by severity, and a chord-chart diff (hand vs. ensemble). Works from `file://` — no local server needed |
+| `--html-report PATH` | Write a single-page HTML audit. Embeds the original audio, every variant as `<audio>` players, a per-cell mixer with comp volume sliders, a **duck song bass** toggle (swaps in a pre-rendered HPF version of the song so the comp's bass cuts through; cutoff via `--duck-hz`), a **📋 Chord chart + theory** popup per cell (shows the bar-by-bar progression with theory annotations like "tritone sub", "added maj7", "secondary dominant" plus voicing breakdowns showing scale degrees), the disagreement table, and a chord-chart diff (hand vs. ensemble). The currently-playing chord is highlighted in the popup during playback. Works from `file://` |
 | `--duck-hz N` | Cutoff Hz for the **duck song bass** pre-rendered HPF version. Default `200`. Lower (e.g. `120`) preserves more low-mids of the song; higher (e.g. `400`) is more aggressive and exposes the comp's bass more |
 
 ## Architecture in one line each
@@ -250,7 +325,7 @@ is two beats each in 4/4.
 - **`bebop/reharm/`** — tiered substitution engine with the spice knob; key-aware modal interchange
 - **`bebop/voicing/`** — chord symbols → MIDI pitches via music21, with four voicing styles and voice leading
 - **`bebop/rhythm/`** — rhythmic comping templates (Charleston, anticipations, etc.)
-- **`bebop/render/`** — pretty_midi MIDI writer, fluidsynth audio renderer, ffmpeg mixer, HTML report generator
+- **`bebop/render/`** — pretty_midi MIDI writer, fluidsynth audio renderer, ffmpeg mixer, HTML report generator, and the chord-chart-explainer (per-variant theory annotations and voicing breakdowns shown in the report's modal)
 - **`vendor/`** — the Vamp Plugin SDK and NNLS-Chroma sources, with a build script that produces an arm64 dylib for `~/Library/Audio/Plug-Ins/Vamp/`
 
 ## Caching

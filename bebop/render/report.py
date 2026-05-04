@@ -49,6 +49,8 @@ class MatrixCell:
     rhythm: str = "charleston" # one of charleston, two_and_four, sustained, anticipations
     alignment: str = "raw"     # "raw" or "aligned" — present when --align-both is on
     piano_bass: str = "off"    # "off" (upright only) or "on" (piano LH doubles bass)
+    midi_source: str = "midi"  # label for which --midi source produced this cell
+                                # (only matters when combining multiple runs)
     midi_path: Path = Path()
     wav_path: Path | None = None
     mix_path: Path | None = None  # legacy; HTML mixer renders in-browser instead
@@ -493,10 +495,15 @@ def _render_diff(hand: str, suggested: str) -> str:
 def _render_bass_variant(c: MatrixCell, report_dir: Path,
                          has_original: bool, default_comp_vol: float,
                          show_rhythm: bool, show_alignment: bool,
-                         show_piano_bass: bool) -> str:
-    """Render one (rhythm, bass[, alignment][, piano_bass]) sub-variant inside a cell."""
-    cell_id = (f"sp{int(round(c.spice * 100)):02d}_{c.voicing}_{c.rhythm}_"
+                         show_piano_bass: bool, show_midi_source: bool) -> str:
+    """Render one (rhythm, bass[, alignment][, piano_bass][, midi_source]) sub-variant."""
+    # cell_id includes midi_source so two cells with same other fields but different
+    # midi sources don't collide
+    cell_id = (f"src_{c.midi_source}_sp{int(round(c.spice * 100)):02d}_{c.voicing}_{c.rhythm}_"
                f"{c.bass}_{c.alignment}_pb{c.piano_bass}")
+    # filename-safe characters only for HTML data-id attributes
+    cell_id = cell_id.replace("/", "_").replace(" ", "_").replace("+", "p")
+
     label_parts = [f"spice {c.spice:.2f}", c.voicing]
     if show_rhythm:
         label_parts.append(c.rhythm)
@@ -505,6 +512,8 @@ def _render_bass_variant(c: MatrixCell, report_dir: Path,
         label_parts.append(f"{c.alignment} timing")
     if show_piano_bass:
         label_parts.append("bass on piano" if c.piano_bass == "on" else "bass on upright")
+    if show_midi_source:
+        label_parts.append(f"midi: {c.midi_source}")
     label = " / ".join(label_parts)
 
     sub_parts = []
@@ -515,6 +524,8 @@ def _render_bass_variant(c: MatrixCell, report_dir: Path,
         sub_parts.append(f"{c.alignment} timing")
     if show_piano_bass:
         sub_parts.append("bass on piano" if c.piano_bass == "on" else "bass on upright")
+    if show_midi_source:
+        sub_parts.append(f"midi: {c.midi_source}")
     sub_label = " · ".join(sub_parts) if sub_parts else f"{c.bass} bass"
 
     parts: list[str] = [f'<div class="bass-variant" data-id="{cell_id}" '
@@ -546,8 +557,8 @@ def _render_bass_variant(c: MatrixCell, report_dir: Path,
     parts.append(f'<div class="label" style="margin-top: 0.3rem;">'
                  f'<a href="{rel_midi}">download .mid</a></div>')
     # chord-chart explainer button — shows reharm + voicing breakdown in a modal
-    progression_id = f"{c.spice:.2f}_{c.alignment}"
-    voicing_id = f"{c.spice:.2f}_{c.alignment}_{c.voicing}"
+    progression_id = f"{c.midi_source}_{c.spice:.2f}_{c.alignment}"
+    voicing_id = f"{c.midi_source}_{c.spice:.2f}_{c.alignment}_{c.voicing}"
     parts.append(
         f'<button class="chart-btn" data-progression-id="{progression_id}" '
         f'data-voicing-id="{voicing_id}" data-label="{html_lib.escape(label)}">'
@@ -564,9 +575,11 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
     rhythms = sorted({c.rhythm for c in cells})
     alignments = sorted({c.alignment for c in cells})
     piano_bass_styles = sorted({c.piano_bass for c in cells})
+    midi_sources = sorted({c.midi_source for c in cells})
     show_rhythm = len(rhythms) > 1
     show_alignment = len(alignments) > 1
     show_piano_bass = len(piano_bass_styles) > 1
+    show_midi_source = len(midi_sources) > 1
     groups: dict[tuple[float, str], list[MatrixCell]] = {}
     for c in cells:
         groups.setdefault((c.spice, c.voicing), []).append(c)
@@ -574,12 +587,15 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
     rhythm_order = {r: i for i, r in enumerate(rhythms)}
     alignment_order = {"raw": 0, "aligned": 1}
     pb_order = {"off": 0, "on": 1}
+    midi_source_order = {s: i for i, s in enumerate(midi_sources)}
     for grp in groups.values():
-        # within a cell: alignment → rhythm → bass → piano_bass (so adjacent rows differ
-        # only by piano_bass, making the comparison ergonomic)
-        grp.sort(key=lambda c: (alignment_order.get(c.alignment, 99),
-                                rhythm_order.get(c.rhythm, 99),
+        # within a cell: rhythm → midi_source → bass → alignment → piano_bass.
+        # putting midi_source second makes adjacent rows differ only by midi_source
+        # within the same rhythm — ideal for the "is the new MIDI better?" A/B
+        grp.sort(key=lambda c: (rhythm_order.get(c.rhythm, 99),
+                                midi_source_order.get(c.midi_source, 99),
                                 bass_order.get(c.bass, 99),
+                                alignment_order.get(c.alignment, 99),
                                 pb_order.get(c.piano_bass, 99)))
 
     out: list[str] = []
@@ -605,7 +621,7 @@ def _render_matrix(cells: list[MatrixCell], report_dir: Path,
                 html_parts.append(_render_bass_variant(c, report_dir, has_original,
                                                        default_comp_vol,
                                                        show_rhythm, show_alignment,
-                                                       show_piano_bass))
+                                                       show_piano_bass, show_midi_source))
             html_parts.append('</div>')
             out.append("".join(html_parts))
     out.append('</div>')

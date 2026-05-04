@@ -12,6 +12,7 @@ dependencies = [
     "scipy>=1.17.1",
     "setuptools>=82.0.1",
     "soundfile>=0.13.1",
+    "tqdm>=4.67.3",
 ]
 
 [project.scripts]

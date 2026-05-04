@@ -6,6 +6,11 @@ __pycache__/
 output/
 .bebop_cache/
 
+# audio + midi artifacts (large binaries; the pipeline regenerates from sources)
+*.wav
+*.mid
+*.midi
+
 # vendor build artifacts (re-build with vendor/build_nnls_chroma.sh)
 vendor/vamp-plugin-sdk/build/
 vendor/nnls-chroma/build/

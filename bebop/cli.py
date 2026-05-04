@@ -24,7 +24,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from tqdm import tqdm
+
 from bebop.io import cache
+from bebop.rhythm import TEMPLATES as _RHYTHM_TEMPLATES
+from bebop.rhythm import all_rhythm_names, resolve_rhythm
 from bebop.io.alignment import compute_first_onset_offset_beats, shift_sequence
 from bebop.io.audio_in import parse_audio
 from bebop.io.chart import parse_chart
@@ -74,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bebop")
     parser.add_argument("--chart", type=Path, help="Real Book-style chord chart")
     parser.add_argument("--midi", type=Path, help="Polyphonic MIDI (e.g. Melodyne export)")
+    parser.add_argument("--midi-source-label", type=str, default=None,
+                        help="Optional label that gets stored in MatrixCell.midi_source. "
+                             "Used by the combiner script to identify which matrix run came "
+                             "from which MIDI source. Defaults to the --midi filename stem.")
     parser.add_argument("--audio", type=Path, help="WAV file for librosa CQT chord recognition")
     parser.add_argument("--basic-pitch", type=Path, dest="basic_pitch",
                         help="WAV file for Spotify basic-pitch (deep-model audio->MIDI->chords). "
@@ -114,14 +122,18 @@ def main(argv: list[str] | None = None) -> int:
                              "with first-onset alignment applied — so you can A/B them in the "
                              "matrix. Implies --first-onset-align if no --midi-offset is given. "
                              "Doubles the variant count.")
+    _rhythm_choices = all_rhythm_names()
     parser.add_argument("--rhythm", default="charleston",
-                        choices=["charleston", "two_and_four", "sustained", "anticipations"],
-                        help="Single rhythm template (used when --rhythms isn't passed).")
+                        choices=_rhythm_choices,
+                        help=f"Single rhythm template (used when --rhythms isn't passed). "
+                             f"Choices: {', '.join(_rhythm_choices)}. "
+                             f"`charleston_+N` variants reuse the charleston template "
+                             f"and globally shift the entire output by N beats.")
     parser.add_argument("--rhythms", default=None,
-                        help="Comma-separated rhythm templates to sweep, e.g. "
-                             "'charleston,anticipations'. Each rhythm × voicing × spice × bass "
-                             "becomes its own variant in the matrix. Choices: charleston, "
-                             "two_and_four, sustained, anticipations. Default: just --rhythm.")
+                        help=f"Comma-separated rhythm templates to sweep, e.g. "
+                             f"'charleston,anticipations'. Each rhythm × voicing × spice × bass "
+                             f"becomes its own variant in the matrix. Choices: "
+                             f"{', '.join(_rhythm_choices)}.")
     parser.add_argument("--voicings", default="rootless,evans,drop2,quartal",
                         help="Comma-separated voicing styles. Each emits its own MIDI/WAV/mix file. "
                              "Choices: rootless, evans, drop2, quartal. Default: all four.")
@@ -301,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         rhythms = [r.strip() for r in args.rhythms.split(",") if r.strip()]
     else:
         rhythms = [args.rhythm]
-    valid_rhythms = {"charleston", "two_and_four", "sustained", "anticipations"}
+    valid_rhythms = set(all_rhythm_names())
     for r in rhythms:
         if r not in valid_rhythms:
             parser.error(f"--rhythms entry {r!r} not in {sorted(valid_rhythms)}")
@@ -361,14 +373,21 @@ def main(argv: list[str] | None = None) -> int:
 
     explainer_progressions: dict[str, list[dict]] = {}
     explainer_voicings: dict[str, list[dict]] = {}
+    # use the midi-source label as a prefix for explainer keys so a future
+    # combiner script can merge multiple runs into one HTML report cleanly
+    midi_source_label = args.midi_source_label or (args.midi.stem if args.midi else "midi")
 
     matrix_cells: list[MatrixCell] = []
+    pbar = tqdm(total=n_variants, unit="variant", dynamic_ncols=True,
+                leave=False,    # clear the bar on close so 100% doesn't linger
+                bar_format="  {desc} {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt} "
+                           "[{elapsed}<{remaining}, {rate_fmt}]")
     for alignment in alignments:
         seq_for_alignment = seqs_per_alignment[alignment]
         for spice in spice_values:
             reharmed = reharmonize(seq_for_alignment, spice=spice, seed=args.seed)
-            # capture the chord-comparison once per (spice, alignment)
-            prog_key = f"{spice:.2f}_{alignment}"
+            # capture the chord-comparison once per (midi_source, spice, alignment)
+            prog_key = f"{midi_source_label}_{spice:.2f}_{alignment}"
             if prog_key not in explainer_progressions:
                 rows = chart_comparison(original_seq, reharmed)
                 explainer_progressions[prog_key] = [
@@ -377,9 +396,9 @@ def main(argv: list[str] | None = None) -> int:
                      "new_bass": r.new_bass, "theory_note": r.theory_note}
                     for r in rows
                 ]
-            # capture voicing breakdown once per (spice, alignment, voicing)
+            # capture voicing breakdown once per (midi_source, spice, alignment, voicing)
             for voicing_style in voicings:
-                vkey = f"{spice:.2f}_{alignment}_{voicing_style}"
+                vkey = f"{midi_source_label}_{spice:.2f}_{alignment}_{voicing_style}"
                 if vkey in explainer_voicings:
                     continue
                 vbs = voicing_breakdown(reharmed, voicing_style)
@@ -419,36 +438,46 @@ def main(argv: list[str] | None = None) -> int:
                             else:
                                 midi_path = base_path
 
+                            tag = (f"spice={spice:.2f} {voicing} {rhythm} "
+                                   f"{bass_style[:4]} {alignment[:3]} pb={pb_style}")
+                            pbar.set_description_str(tag)
+
+                            template_name, shift_beats = resolve_rhythm(rhythm)
                             midi_out = write_midi(
-                                reharmed, midi_path, rhythm=rhythm,
+                                reharmed, midi_path, rhythm=template_name,
                                 include_bass=(bass_style != "none"), voicing=voicing,
                                 walking_bass=(bass_style == "walking"),
                                 dynamics_envelope=dynamics_env,
                                 piano_bass=(pb_style == "on"),
+                                global_shift_beats=shift_beats,
                             )
-                            tag = (f"spice={spice:.2f} {voicing:<8} {rhythm:<13} "
-                                   f"{bass_style:<9} {alignment:<7} {pb_style:<3}")
-                            print(f"[{tag}] MIDI: {midi_out}")
 
                             wav_out: Path | None = None
                             mix_out: Path | None = None
                             if args.render_audio or args.mix_with:
                                 wav_out = midi_out.with_suffix(".wav")
                                 render_midi_to_wav(midi_out, wav_out, soundfont_path=args.soundfont)
-                                print(f"[{tag}] WAV:  {wav_out}")
 
                                 if args.mix_with and not args.html_report:
                                     mix_out = midi_out.with_suffix(".mix.wav")
                                     mix_audio(wav_out, args.mix_with, mix_out,
                                               comp_gain_db=args.comp_gain_db,
                                               original_gain_db=args.song_gain_db)
-                                    print(f"[{tag}] MIX:  {mix_out}")
 
                             matrix_cells.append(MatrixCell(
                                 spice=spice, voicing=voicing, rhythm=rhythm, bass=bass_style,
                                 alignment=alignment, piano_bass=pb_style,
+                                midi_source=midi_source_label,
                                 midi_path=midi_out, wav_path=wav_out, mix_path=mix_out,
                             ))
+                            pbar.update(1)
+    elapsed_str = pbar.format_dict.get("elapsed", 0)
+    pbar.close()
+    print()
+    print()
+    print(f"  ✓ Done — {n_variants} variants rendered in "
+          f"{tqdm.format_interval(elapsed_str)}")
+    print()
 
     if args.html_report:
         hand_text = args.chart.read_text() if args.chart else None
