@@ -160,7 +160,10 @@ func renderBurst(_ seconds: Double) {
         ts.mSampleTime += Double(kFrames)
     }
 }
-for _ in 0..<10 {
+// 16 passes covers stability=3 recognition latency
+// (window 1.0s + (3-1)*period 0.3s = 1.6s minimum) with comfortable
+// headroom; matches the v2 MIDI test's iteration count
+for _ in 0..<16 {
     renderBurst(0.5)
     Thread.sleep(forTimeInterval: 0.2)
     renderBurst(0.5)

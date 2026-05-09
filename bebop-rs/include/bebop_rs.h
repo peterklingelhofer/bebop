@@ -74,6 +74,18 @@ size_t bebop_pull_midi_events(BebopHandle* handle,
                                BebopMidiEvent* out,
                                size_t max_events);
 
+/* Panic flush: drain ALL pending events and return note_offs for any
+ * currently-sounding notes (note_on already drained, note_off still
+ * pending). Note_offs whose paired note_on never fired are dropped.
+ *
+ * The AU shell calls this on transport-stop so the recording region
+ * captures real note_offs before Logic stops capturing — without this,
+ * a note_on near the end of the region pairs with a note_off scheduled
+ * after stop and Logic's recorded MIDI shows the note hanging */
+size_t bebop_panic_flush(BebopHandle* handle,
+                         BebopMidiEvent* out,
+                         size_t max_events);
+
 /* Parameter IDs for `bebop_set_param`. */
 enum BebopParam {
     BEBOP_PARAM_BPM           = 0,  /* float, BPM (clamped to 40..240) */
