@@ -18,7 +18,7 @@ path = "src/bin/bebop_cli.rs"
 
 [dependencies]
 # embedded Python — auto-initialize means we own the interpreter lifecycle
-pyo3 = { version = "0.22", features = ["auto-initialize"] }
+pyo3 = { version = "0.24", features = ["auto-initialize"] }
 # WAV I/O for the CLI binary's --in flag
 hound = "3.5"
 # MIDI writing for the CLI binary's --out flag (lightweight, no_std-friendly)
