@@ -1,0 +1,18 @@
+# Tell PyO3 to use the project's uv-managed Python rather than the system one.
+# PyO3's build script runs `$PYO3_PYTHON -c "..."` to discover libpython paths,
+# include directories, and the ABI version to link against.
+#
+# At runtime the embedded interpreter inherits this Python's site-packages so
+# `import bebop` finds the project's editable install — no separate venv,
+# no PYTHONPATH gymnastics.
+
+[env]
+PYO3_PYTHON = "/Users/peterklingelhofer/Dev/bebop/.venv/bin/python3"
+
+# Pin `cargo test` to single-threaded execution. PyO3's embedded Python can
+# only be initialized once per process; multiple test threads racing into
+# Python::with_gil() during interpreter init deadlock indefinitely.
+# Tests are I/O-bound on Python anyway, so we lose nothing by serializing.
+[env.RUST_TEST_THREADS]
+value = "1"
+force = true

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- AUv2 .component bundle Info.plist -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>BebopAU</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.bebop.au.BebopAU</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>BebopAU</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+
+    <!-- AudioComponent registration. The factoryFunction value is the C
+         function name that AUSDK_COMPONENT_ENTRY emits in BebopAU.cpp:
+         it's literally "BebopAUFactory" because the macro names it after
+         the class with "Factory" suffix. -->
+    <key>AudioComponents</key>
+    <array>
+        <dict>
+            <key>name</key>
+            <string>Bbop: bebop comp</string>
+            <key>description</key>
+            <string>Live jazz comping driven by the audio bus's chord content.</string>
+            <key>factoryFunction</key>
+            <string>BebopAUFactory</string>
+            <key>type</key>
+            <string>aufx</string>
+            <key>subtype</key>
+            <string>BBOP</string>
+            <key>manufacturer</key>
+            <string>Bbop</string>
+            <key>version</key>
+            <integer>65536</integer>
+            <key>tags</key>
+            <array>
+                <string>Effects</string>
+                <string>MIDI</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

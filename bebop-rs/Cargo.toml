@@ -1,0 +1,40 @@
+[package]
+name = "bebop-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Native Rust core for the bebop AU plugin: embeds Python via PyO3, wraps the bebop chord-recognition + comp pipeline behind a thread-safe API."
+publish = false
+
+[lib]
+name = "bebop_rs"
+crate-type = ["lib", "staticlib"]
+# staticlib lets us link the library into the Swift AU shell later; "lib"
+# keeps it as a normal Rust crate so the test binaries can link to it too.
+
+[[bin]]
+name = "bebop_cli"
+path = "src/bin/bebop_cli.rs"
+
+[dependencies]
+# embedded Python — auto-initialize means we own the interpreter lifecycle
+pyo3 = { version = "0.22", features = ["auto-initialize"] }
+# WAV I/O for the CLI binary's --in flag
+hound = "3.5"
+# MIDI writing for the CLI binary's --out flag (lightweight, no_std-friendly)
+midly = "0.5"
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+# error handling
+anyhow = "1"
+thiserror = "1"
+
+[dev-dependencies]
+# differential-test fixtures live in tests/eval/, but we'll point at the
+# already-rendered .wav files via env vars at test time
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

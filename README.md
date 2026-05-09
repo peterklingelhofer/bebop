@@ -177,6 +177,79 @@ HPF version while preserving playback position — so you can flip on the fly to
 hear the comp's bass cut through the song. No Web Audio, no local server, no
 CORS issues.
 
+## Realtime modes — two options
+
+There are two ways to run bebop in real time:
+
+1. **Native AU plugin** ([bebop-au/](bebop-au/)) — a `.component` you drop
+   into Logic. Plugin loads on a bus, recognizes chords from the audio
+   passing through it, emits MIDI to whatever destination you route the
+   AU's MIDI output to. No virtual audio cables, no browser dashboard,
+   no separate Python process — it's just an Audio Unit. **This is the
+   recommended path for Logic users.** See [bebop-au/README.md](bebop-au/README.md).
+2. **`bebop live` CLI** (described below) — a Python process that listens
+   to a virtual audio cable (BlackHole) and streams MIDI back via the
+   IAC Driver bus. Predates the AU plugin and is still maintained as the
+   alternative for users without a host that loads AUv2 plugins, or who
+   want to control the comp through a browser dashboard rather than the
+   AU's parameter UI.
+
+Both share the underlying chord recognition + voicing + rhythm code in the
+[`bebop/` Python package](bebop/).
+
+## Live mode (`bebop live`)
+
+`bebop live` is a real-time accompanist: it listens to a virtual audio cable,
+recognizes chords as they play in your DAW, and **streams MIDI back into Logic
+in real time** through the IAC Driver bus. A browser dashboard exposes spice
+/ voicing / rhythm / bpm / piano-bass knobs that take effect at the next
+chord change. A `.mid` file is written to disk in parallel (back-dated by the
+recognition lag) so you also get a clean offline-aligned take.
+
+**Inherent latency:** the recognizer needs ~1 s of audio to identify a chord,
+so the live comp lands ~1 beat behind each chord change. It reacts like a
+slightly-late accompanist, not a click-locked piano. Acceptable in most
+contexts, but if it bothers you, the disk MIDI is back-dated and lines up
+when dragged in offline.
+
+### One-time setup (macOS)
+
+```bash
+# free virtual audio cable for routing Logic's audio out → bebop's audio in
+brew install blackhole-2ch
+```
+
+In **Audio MIDI Setup** (`/Applications/Utilities/Audio MIDI Setup.app`):
+1. **Window → Show MIDI Studio**
+2. Double-click **IAC Driver** → check *Device is online* → keep "Bus 1"
+3. **Window → Show Audio Devices** → `+` → *Create Multi-Output Device*
+4. Check both your normal output (e.g. Built-in Output / AirPods) and **BlackHole 2ch**
+
+In **Logic**:
+1. **Logic Pro → Settings → Audio → Output Device**: the Multi-Output Device
+2. New software-instrument track → **input**: *IAC Driver Bus 1* → load a
+   piano patch. (Optional: a second track for *channel 2* with a bass patch
+   — bebop sends piano on ch 1, bass on ch 2.)
+3. Mute drum tracks before pressing play (chroma recognition gets confused
+   by transients).
+
+### Run
+
+```bash
+bebop live                              # auto-picks BlackHole + IAC
+bebop live --list-devices               # audio input ports
+bebop live --list-midi-outs             # MIDI output ports
+bebop live --no-midi                    # disk-only mode (no live IAC)
+bebop live --bpm 94 --spice 0.5 --voicing evans --rhythm charleston \
+           --midi-out "IAC Driver Bus 1"
+```
+
+The dashboard at `http://127.0.0.1:8765/` (auto-opens) shows the audio level
+meter (so you know BlackHole is feeding signal), the currently-heard chord,
+recent history, all knobs, and a panic button. Knob changes apply at the
+next chord change. Press **Ctrl-C** to stop — the .mid file you wanted is
+already at `output/live_<timestamp>.mid`.
+
 ## Butterfly boy reference command
 
 Preferred config for the bundled `audio/butterfly boy ...` files — piano
