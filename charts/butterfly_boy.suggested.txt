@@ -5,28 +5,28 @@ bpm: 94
 time: 4/4
 key: F
 
-| G | Ab | Fmaj7 C | C |
-| F | D#m7/F# Eb | F | G C |
+| G | Fmaj7 | C | Fmaj7/C F/A |
+| F | Eb | F | Fmaj7/E Csus4 |
 key: C
-| F | C | C | F/C C |
-| C | C G | C7 | Emaj7 E7 |
+| F | C F6/F# | F/C C | C |
+| C | C F/F# | Amaj7/E C7 | E6/C# E6 |
 key: C#m
-| C#m | C#m | G#7 | G#7 |
-| Fmaj7 | C | Fmaj7 | Eb G#6/D# |
+| Amaj7 C#m | C#m | G#7 Emaj7 | G#7 |
+| C C/G | Fmaj7 F/C | Fmaj7 | Eb |
 key: C
-| C Cmaj7 | C | F | C |
-| C | F C | Fmaj7/C G | D7 |
-| Dm7/G# Dm7 | A Am7 | Am7 G | Fmaj7/C Fmaj7 |
-| Dm7 | D | D | Bm/E Bm7 |
+| C | C | F | C |
+| C | C | G Fmaj7/C | D7 |
+| D | Em A | G Fmaj7/C Fmaj7/E | D |
+| Dmaj7 | D | D | A |
 key: D
-| A | D6 D | A Dmaj7 | Bm Bm7 |
-| A Bm | D | A | D Dmaj7 |
-| A | Bm7/G# Bm7/A | A Bm7/F# | D |
-| A Bm/E | Bm D | A Bm/F# | Bm D |
-| A Dmaj7 | D Bm/D Bm7 | A Dmaj7 | D |
-| A6 Dmaj7 | D | A Gmaj7/F# | Gmaj7/F# E |
+| A D | D | A | D |
+| D A | D | A | D |
+| A D6/A | D | A D | D |
+| Bm D | D | A D6/C# | D |
+| A | D | A | D |
+| D D6/F# | D | A | D6 E |
 key: E
-| E | E | E | E Dmaj7/A |
-| A | D Bm D | A | Bm/E B7 |
+| E | E | E Dmaj7 | A6 Dmaj7 |
+| A | D | D | Dmaj7 B7 |
 | E | E | E | F#m7 |
 | E | - |

@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>bebop · live comp</title>
+<style>
+  :root {
+    --bg: #0e1116; --fg: #e6e6e6; --muted: #9aa1ad;
+    --accent: #ffba49; --good: #6dd183; --warn: #ff6b6b;
+    --card: #161a22; --border: #232a35;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+    background: var(--bg); color: var(--fg); padding: 24px; line-height: 1.4;
+  }
+  h1 { margin: 0 0 4px 0; font-weight: 600; font-size: 20px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .level-row {
+    display: flex; align-items: center; gap: 10px; max-width: 920px;
+    margin-bottom: 24px; font-size: 12px; color: var(--muted);
+  }
+  .level-label {
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); width: 18px;
+  }
+  .level-bar {
+    flex: 1; height: 8px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 4px; overflow: hidden; position: relative;
+  }
+  #level-fill {
+    height: 100%; width: 0%; background: var(--good);
+    transition: width 80ms linear, background 80ms linear;
+  }
+  .level-mark {
+    /* faint tick marking the silence threshold */
+    position: absolute; top: 0; bottom: 0; width: 1px;
+    background: var(--muted); opacity: 0.4;
+  }
+  #level-text { width: 56px; text-align: right; font-feature-settings: "tnum"; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; max-width: 920px; }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px;
+  }
+  .card h2 {
+    margin: 0 0 12px 0; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted);
+  }
+  .now-chord {
+    font-size: 56px; font-weight: 700; letter-spacing: -0.02em; color: var(--accent);
+    margin: 4px 0; font-feature-settings: "tnum";
+  }
+  .now-chord.silent { color: var(--muted); font-size: 28px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; font-size: 13px; }
+  .stat-label { color: var(--muted); }
+  .stat-value { font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .row label { width: 88px; font-size: 13px; color: var(--muted); }
+  .row input[type=range] { flex: 1; }
+  .row select, .row input[type=number] {
+    background: var(--bg); color: var(--fg);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; min-width: 130px;
+  }
+  .value { font-weight: 600; min-width: 38px; text-align: right; font-feature-settings: "tnum"; }
+  .toggle {
+    display: inline-flex; align-items: center; gap: 8px; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 14px; font-size: 13px;
+  }
+  .toggle.on { border-color: var(--good); color: var(--good); }
+  .toggle.off { border-color: var(--warn); color: var(--warn); }
+  .panic-btn {
+    background: var(--bg); border: 1px solid var(--warn); color: var(--warn);
+    border-radius: 6px; padding: 8px 14px; font-size: 13px; font-weight: 600;
+    cursor: pointer; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .panic-btn:hover { background: var(--warn); color: var(--bg); }
+  .recent { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  .recent .row-rec {
+    display: grid; grid-template-columns: 80px 1fr 60px;
+    padding: 4px 0; border-bottom: 1px solid var(--border);
+  }
+  .recent .row-rec:last-child { border: none; }
+  .recent .row-rec .t { color: var(--muted); }
+  .status-pill {
+    display: inline-block; padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .status-pill.connected { background: rgba(109, 209, 131, 0.15); color: var(--good); }
+  .status-pill.disconnected { background: rgba(255, 107, 107, 0.15); color: var(--warn); }
+  footer {
+    margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px; max-width: 920px;
+  }
+  code { background: rgba(255,255,255,0.06); padding: 1px 5px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <h1>bebop · live comp <span id="status" class="status-pill disconnected">connecting</span></h1>
+  <div class="subtitle">
+    audio in: <span id="device">—</span> ·
+    MIDI out: <span id="midi-port">—</span> ·
+    disk: <span id="output-path">—</span>
+  </div>
+  <div class="level-row">
+    <span class="level-label">in</span>
+    <div class="level-bar"><div id="level-fill"></div><div class="level-mark" style="left:30%"></div></div>
+    <span id="level-text">—</span>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>now hearing</h2>
+      <div id="now-chord" class="now-chord silent">— silence —</div>
+      <div class="stats">
+        <div><div class="stat-label">key</div><div id="now-key" class="stat-value">—</div></div>
+        <div><div class="stat-label">conf</div><div id="now-conf" class="stat-value">—</div></div>
+        <div><div class="stat-label">hits</div><div id="now-hits" class="stat-value">0</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>knobs</h2>
+      <div class="row">
+        <label>spice</label>
+        <input id="k-spice" type="range" min="0" max="1" step="0.01" value="0.4">
+        <span id="v-spice" class="value">0.40</span>
+      </div>
+      <div class="row">
+        <label>voicing</label>
+        <select id="k-voicing">
+          <option value="rootless">rootless</option>
+          <option value="evans">evans</option>
+          <option value="drop2">drop2</option>
+          <option value="quartal">quartal</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>rhythm</label>
+        <select id="k-rhythm"></select>
+      </div>
+      <div class="row">
+        <label>bpm</label>
+        <input id="k-bpm" type="number" min="40" max="240" step="1" value="120">
+      </div>
+      <div class="row">
+        <label>piano bass</label>
+        <button id="k-piano-bass" class="toggle off">off</button>
+      </div>
+      <div class="row">
+        <label>output</label>
+        <button id="k-enabled" class="toggle on">on</button>
+      </div>
+      <div class="row">
+        <label></label>
+        <button id="k-panic" class="panic-btn">panic — all notes off</button>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / span 2;">
+      <h2>recent chords</h2>
+      <div id="recent" class="recent"></div>
+    </div>
+  </div>
+
+  <footer>
+    live MIDI streams to your IAC port in real time — point a Logic software
+    instrument track at it. chord recognition has ~1 s of inherent lag, so the
+    comp lands just behind each chord change. for an offline-aligned version,
+    drag <code id="footer-out">output/live_session.mid</code> into Logic
+    afterwards (the disk file is back-dated by the recognition lag).
+  </footer>
+
+<script>
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  const recent = [];
+
+  // RMS=0.3 is already hot for line-level audio — map it to 100% on the
+  // meter. Anything above just paints red. Silence-threshold tick is
+  // positioned by `silence_rms` from the init message.
+  const LEVEL_FULL_SCALE = 0.3;
+  let silenceRms = 0.005;
+  const elStatus = document.getElementById('status');
+  const elDevice = document.getElementById('device');
+  const elOutput = document.getElementById('output-path');
+  const elFooterOut = document.getElementById('footer-out');
+  const elNowChord = document.getElementById('now-chord');
+  const elNowKey = document.getElementById('now-key');
+  const elNowConf = document.getElementById('now-conf');
+  const elNowHits = document.getElementById('now-hits');
+  const elRecent = document.getElementById('recent');
+
+  ws.onopen = () => {
+    elStatus.textContent = 'connected';
+    elStatus.className = 'status-pill connected';
+  };
+  ws.onclose = () => {
+    elStatus.textContent = 'disconnected';
+    elStatus.className = 'status-pill disconnected';
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'init') {
+      elDevice.textContent = msg.device || '—';
+      elOutput.textContent = msg.output_path;
+      elFooterOut.textContent = msg.output_path;
+      const elMidi = document.getElementById('midi-port');
+      elMidi.textContent = msg.midi_port || '(disk only)';
+      elMidi.style.color = (msg.midi_port && msg.midi_port !== '(disk only)')
+        ? 'var(--good)' : 'var(--warn)';
+      // place the silence-threshold marker at its real position on the meter
+      if (typeof msg.silence_rms === 'number') {
+        silenceRms = msg.silence_rms;
+        const pct = Math.min(100, (silenceRms / LEVEL_FULL_SCALE) * 100);
+        document.querySelector('.level-mark').style.left = pct + '%';
+      }
+      // populate rhythm dropdown
+      const sel = document.getElementById('k-rhythm');
+      sel.innerHTML = '';
+      for (const r of msg.rhythms) {
+        const opt = document.createElement('option');
+        opt.value = r; opt.textContent = r;
+        sel.appendChild(opt);
+      }
+      // hydrate from server's current knob values
+      applyKnobs(msg.knobs);
+    } else if (msg.type === 'chord') {
+      elNowChord.classList.remove('silent');
+      elNowChord.textContent = msg.symbol;
+      elNowKey.textContent = msg.key;
+      elNowConf.textContent = msg.confidence.toFixed(2);
+      recent.unshift({ t: msg.t, sym: msg.symbol, key: msg.key });
+      if (recent.length > 12) recent.pop();
+      renderRecent();
+    } else if (msg.type === 'silence') {
+      elNowChord.classList.add('silent');
+      elNowChord.textContent = '— silence —';
+    } else if (msg.type === 'stats') {
+      elNowHits.textContent = msg.total_hits;
+    } else if (msg.type === 'level') {
+      updateLevel(msg.rms);
+    } else if (msg.type === 'knobs') {
+      applyKnobs(msg.knobs);
+    }
+  };
+
+  function updateLevel(rms) {
+    const pct = Math.min(100, (rms / LEVEL_FULL_SCALE) * 100);
+    const fill = document.getElementById('level-fill');
+    fill.style.width = pct + '%';
+    // green when audible, muted when below silence threshold, red when clipping
+    let color = 'var(--good)';
+    if (rms < silenceRms) color = 'var(--muted)';
+    else if (rms > LEVEL_FULL_SCALE) color = 'var(--warn)';
+    fill.style.background = color;
+    document.getElementById('level-text').textContent = rms < 1e-4
+      ? '—'
+      : rms.toFixed(3);
+  }
+
+  function applyKnobs(k) {
+    document.getElementById('k-spice').value = k.spice;
+    document.getElementById('v-spice').textContent = Number(k.spice).toFixed(2);
+    document.getElementById('k-voicing').value = k.voicing;
+    document.getElementById('k-rhythm').value = k.rhythm;
+    document.getElementById('k-bpm').value = k.bpm;
+    setToggle('k-piano-bass', k.piano_bass);
+    setToggle('k-enabled', k.enabled);
+  }
+
+  function setToggle(id, on) {
+    const el = document.getElementById(id);
+    el.classList.toggle('on', !!on);
+    el.classList.toggle('off', !on);
+    el.textContent = on ? 'on' : 'off';
+  }
+
+  function send(patch) {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'knobs', ...patch }));
+  }
+
+  function renderRecent() {
+    elRecent.innerHTML = recent.map(r => {
+      const m = Math.floor(r.t / 60), s = (r.t % 60).toFixed(1).padStart(4, '0');
+      return `<div class="row-rec"><span class="t">${m}:${s}</span><span>${r.sym}</span><span>${r.key}</span></div>`;
+    }).join('');
+  }
+
+  // wire knobs → server
+  document.getElementById('k-spice').addEventListener('input', (e) => {
+    document.getElementById('v-spice').textContent = Number(e.target.value).toFixed(2);
+    send({ spice: Number(e.target.value) });
+  });
+  document.getElementById('k-voicing').addEventListener('change', (e) => send({ voicing: e.target.value }));
+  document.getElementById('k-rhythm').addEventListener('change', (e) => send({ rhythm: e.target.value }));
+  document.getElementById('k-bpm').addEventListener('change', (e) => send({ bpm: Number(e.target.value) }));
+  document.getElementById('k-piano-bass').addEventListener('click', (e) => {
+    const next = !e.target.classList.contains('on');
+    setToggle('k-piano-bass', next);
+    send({ piano_bass: next });
+  });
+  document.getElementById('k-enabled').addEventListener('click', (e) => {
+    const next = !e.target.classList.contains('on');
+    setToggle('k-enabled', next);
+    send({ enabled: next });
+  });
+  document.getElementById('k-panic').addEventListener('click', () => {
+    if (ws.readyState === 1) ws.send(JSON.stringify({ type: 'panic' }));
+  });
+</script>
+</body>
+</html>

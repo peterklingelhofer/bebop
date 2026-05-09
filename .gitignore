@@ -17,3 +17,13 @@ vendor/nnls-chroma/build/
 vendor/nnls-chroma/*.o
 vendor/nnls-chroma/*.dylib
 vendor/nnls-chroma/*.bak
+
+# Rust build artifacts (Cargo.lock is committed — bebop_cli is a binary
+# crate, so pinning deps for reproducibility is the right call)
+bebop-rs/target/
+
+# AU plugin build artifacts
+bebop-au/build/
+
+# Vendored AudioUnitSDK is a git submodule-style dependency — committed via
+# git but build outputs from xcodebuild are gitignored above

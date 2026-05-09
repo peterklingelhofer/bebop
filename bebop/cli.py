@@ -74,7 +74,142 @@ def _print_progression(label: str, seq: ChordSequence) -> None:
         print(f"  bar {bar:>3} beat {beat_in_bar:>3.1f}  {sym:<14}  ({c.duration_beats}b){conf}")
 
 
+def _live_main(argv: list[str]) -> int:
+    """`bebop live` subcommand — listens to a virtual audio cable, recognizes
+    chords in real time, and writes a MIDI file you can drag into your DAW
+    when the session ends. Knobs (spice, voicing, rhythm, bpm) live in a
+    browser dashboard."""
+    import asyncio
+
+    from bebop.live.app import run_live
+    from bebop.live.audio_capture import list_input_devices
+    from bebop.live.midi_out import list_outputs as list_midi_outputs
+    from bebop.rhythm import all_rhythm_names
+
+    parser = argparse.ArgumentParser(
+        prog="bebop live",
+        description="Real-time jazz comping from any virtual audio cable.",
+    )
+    parser.add_argument("--out", type=Path, default=None,
+                        help="MIDI output path. Default: a timestamped file under "
+                             "output/ (e.g. live_20260506-1207.mid) so successive "
+                             "sessions don't overwrite each other.")
+    parser.add_argument("--force", action="store_true",
+                        help="When --out is an existing file, overwrite it instead "
+                             "of erroring out. Has no effect on the default "
+                             "timestamped path (always unique).")
+    parser.add_argument("--device", default=None,
+                        help="Audio input device index or name substring. "
+                             "Default: auto-pick BlackHole if installed, else system default.")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List audio input devices and exit.")
+    parser.add_argument("--list-midi-outs", action="store_true",
+                        help="List MIDI output ports (for --midi-out) and exit.")
+    parser.add_argument("--midi-out", default=None,
+                        help="MIDI output port name or substring (default: auto-pick "
+                             "first IAC port). Use --list-midi-outs to see candidates.")
+    parser.add_argument("--no-midi", action="store_true",
+                        help="Disable live MIDI output entirely (disk-only mode).")
+    parser.add_argument("--bpm", type=float, default=120.0,
+                        help="Initial BPM (changeable from the dashboard). Default 120.")
+    parser.add_argument("--spice", type=float, default=0.4,
+                        help="Initial spice (0..1). Default 0.4.")
+    parser.add_argument("--voicing", default="rootless",
+                        choices=["rootless", "evans", "drop2", "quartal"],
+                        help="Initial voicing style. Default rootless.")
+    parser.add_argument("--rhythm", default="charleston",
+                        choices=all_rhythm_names(),
+                        help="Initial rhythm template. Default charleston.")
+    parser.add_argument("--piano-bass", action="store_true",
+                        help="Piano LH carries the bassline (solo-piano feel). "
+                             "Default off; bass instrument plays the line.")
+    parser.add_argument("--host", default="127.0.0.1", help="Dashboard host.")
+    parser.add_argument("--port", type=int, default=8765, help="Dashboard port.")
+    parser.add_argument("--flush-seconds", type=float, default=5.0,
+                        help="How often to rewrite the MIDI file. Default 5s.")
+    parser.add_argument("--analysis-window", type=float, default=1.0,
+                        help="Seconds of audio per chord-recognition pass. Default 1.0 "
+                             "(faster reaction; raise to 1.5 for steadier reads).")
+    parser.add_argument("--analysis-period", type=float, default=0.3,
+                        help="Seconds between consecutive analyses. Default 0.3.")
+    parser.add_argument("--stability-frames", type=int, default=2,
+                        help="Consecutive analyses agreeing before a chord is committed. "
+                             "Default 2 (kills most transitional-window flicker, costs "
+                             "~0.3s extra lag). Set to 1 for snappier reaction at the "
+                             "cost of more spurious chord changes.")
+    parser.add_argument("--silence-rms", type=float, default=0.005,
+                        help="RMS below this is treated as silence (no chord emitted). Default 0.005.")
+
+    args = parser.parse_args(argv)
+
+    if args.list_devices:
+        print("audio input devices:")
+        for d in list_input_devices():
+            print(f"  [{d.index}] {d.name}  ({d.channels} ch, {d.samplerate:.0f} Hz)")
+        return 0
+
+    if args.list_midi_outs:
+        ports = list_midi_outputs()
+        if not ports:
+            print("no MIDI output ports found.")
+            print("on macOS, enable IAC Driver in Audio MIDI Setup → Show MIDI Studio.")
+            return 0
+        print("MIDI output ports:")
+        for p in ports:
+            print(f"  {p}")
+        return 0
+
+    # resolve --out: timestamp default; refuse to overwrite an existing
+    # explicit path unless --force was passed
+    if args.out is None:
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = Path("output") / f"live_{ts}.mid"
+    else:
+        out_path = args.out
+        if out_path.exists() and not args.force:
+            print(f"refusing to overwrite existing file: {out_path}")
+            print("re-run with --force to overwrite, or pick a different --out path")
+            return 2
+
+    # accept --device by index or by name substring
+    device: int | str | None = None
+    if args.device is not None:
+        try:
+            device = int(args.device)
+        except ValueError:
+            match = next((d for d in list_input_devices() if args.device.lower() in d.name.lower()), None)
+            if match is None:
+                print(f"no input device matches {args.device!r}. try --list-devices")
+                return 2
+            device = match.index
+
+    return asyncio.run(run_live(
+        output_path=out_path,
+        device=device,
+        midi_port=args.midi_out,
+        no_midi=args.no_midi,
+        bpm=args.bpm,
+        spice=args.spice,
+        voicing=args.voicing,
+        rhythm=args.rhythm,
+        piano_bass=args.piano_bass,
+        host=args.host,
+        port=args.port,
+        flush_seconds=args.flush_seconds,
+        analysis_window=args.analysis_window,
+        analysis_period=args.analysis_period,
+        stability_frames=args.stability_frames,
+        silence_rms=args.silence_rms,
+    ))
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "live":
+        return _live_main(argv[1:])
+
     parser = argparse.ArgumentParser(prog="bebop")
     parser.add_argument("--chart", type=Path, help="Real Book-style chord chart")
     parser.add_argument("--midi", type=Path, help="Polyphonic MIDI (e.g. Melodyne export)")

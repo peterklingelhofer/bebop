@@ -1,0 +1,32 @@
+# butterfly_boy auto-chart from ensemble of 6 sources
+# Edit freely — this is a starting point from ensemble vote.
+
+bpm: 94
+time: 4/4
+key: F
+
+| G | Fmaj7 | C | Fmaj7/C F/A |
+| F | Eb | F Cmaj7/E F | Fmaj7/E Fmaj7 |
+key: C
+| F | C F6 F6/F# | Fmaj7 C | C |
+| C | C F/F# | C7 E6/C# | E6/C# E6 |
+key: C#m
+| Amaj7 C#m | C#m | G#7 Emaj7 | G#7 Fmaj7 |
+| Fmaj7 | Fmaj7 | Fmaj7 | C#maj7/F Eb |
+key: C
+| C | C | F Cmaj7/E F | C |
+| F6 Fmaj7 C | C | G Fmaj7/C | G7/B D7 |
+| D | Em A | G Fmaj7/E | G7/B D Fmaj7 D |
+| Dm7 D/A | Em7 D | D | A |
+key: D
+| A D A | A6/C# D | D6 Bm/D A | A6 |
+| D A | A6 A6/C# D | A Dmaj7 A | A6 D |
+| D6/F D6/F# A | A A6/G D | D | D A6 A D |
+| Bm A D6/A | D A6 D | A Bm/C# D6/C# A | A6 D |
+| A Bm/E D | D A6 D | D | D A A6 D |
+| D D6/F# | D A6 D | D Gmaj7/D A | Dmaj7 A6 E |
+key: E
+| E | E | D6 E Dmaj7 | A6 D/A |
+| D | D | D | D B7 |
+| E | E | E | F#m7 |
+| E | - |
