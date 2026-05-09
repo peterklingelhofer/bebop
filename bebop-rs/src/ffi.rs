@@ -512,7 +512,12 @@ fn run_comp(
     kwargs.set_item("bpm", bpm as f64)?;
     kwargs.set_item("voicing", voicing)?;
     kwargs.set_item("rhythm", rhythm)?;
-    kwargs.set_item("n_bars", 4i64)?;
+    // 1 bar of comp per chord change. Was 4 bars but that left long
+    // hanging tails — bass would sustain 16 beats (~10s at 100 BPM) on
+    // any chord that didn't quickly transition, making recordings look
+    // "perpetual." 1 bar releases cleanly and the next chord change
+    // (or the panic flush on transport stop) restarts the comp
+    kwargs.set_item("n_bars", 1i64)?;
     kwargs.set_item("spice", spice as f64)?;
     kwargs.set_item("octave_shift", octave_shift)?;
     if let Some(b) = prev_bass {
@@ -575,6 +580,63 @@ pub unsafe extern "C" fn bebop_pull_midi_events(
         (*dst)._pad = 0;
         count += 1;
     }
+    count
+}
+
+/// Panic-flush: drain ALL pending events, returning note_offs for any notes
+/// that are currently sounding (note_on already drained, note_off still
+/// pending). Note_offs whose paired note_on hasn't fired yet are dropped
+/// (the note never sounded — no need to release it).
+///
+/// Called by the AU shell on transport-stop edge so the recording region
+/// captures real note_offs before Logic stops capturing. Without this, a
+/// note_on near the end of the region pairs with a note_off scheduled
+/// after stop, and Logic's recorded MIDI shows the note hanging to the
+/// end of the region.
+///
+/// # Safety
+/// `out` must point to at least `max_events` `CBebopMidiEvent` slots.
+#[no_mangle]
+pub unsafe extern "C" fn bebop_panic_flush(
+    handle: *mut BebopHandle,
+    out: *mut CBebopMidiEvent,
+    max_events: usize,
+) -> usize {
+    if handle.is_null() || out.is_null() || max_events == 0 {
+        return 0;
+    }
+    let handle: &BebopHandle = &*handle;
+    let mut state = match handle.state.lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let old: Vec<PendingMidiEvent> = state.pending.drain(..).collect();
+    let mut count = 0;
+    for ev in &old {
+        if (ev.status & 0xF0) != 0x80 {
+            continue; // skip note_ons (and any non-note_off)
+        }
+        let on_still_pending = old.iter().any(|other| {
+            (other.status & 0xF0) == 0x90
+                && (other.status & 0x0F) == (ev.status & 0x0F)
+                && other.pitch == ev.pitch
+        });
+        if on_still_pending {
+            continue; // note_on never fired — its note_off is moot
+        }
+        if count >= max_events {
+            break;
+        }
+        let dst = out.add(count);
+        (*dst).status = ev.status;
+        (*dst).pitch = ev.pitch;
+        (*dst).velocity = ev.velocity;
+        (*dst)._pad = 0;
+        count += 1;
+    }
+    // last_comped_chord stays set so we don't immediately re-comp the same
+    // chord on play resume; the new chord recognition cycle will pick up
+    // naturally
     count
 }
 

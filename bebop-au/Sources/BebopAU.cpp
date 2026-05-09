@@ -640,6 +640,17 @@ public:
             mTransportFlags.store(flags, std::memory_order_relaxed);
             mCycleStartBeat.store(cycleStart, std::memory_order_relaxed);
             mCycleEndBeat.store(cycleEnd, std::memory_order_relaxed);
+
+            // Transport-stop edge: drain Rust's pending note_offs into the
+            // MIDI queue NOW so the recording region captures them before
+            // Logic stops capturing. Also send all-notes-off CC123 on both
+            // channels as a safety belt for any sounding notes whose
+            // note_off pair somehow isn't pending (defensive)
+            const bool wasPlaying = mWasPlaying.exchange(
+                isPlaying, std::memory_order_relaxed);
+            if (wasPlaying && !isPlaying) {
+                panicFlush();
+            }
         }
 
         UInt32  deltaToNextBeat = 0;
@@ -778,6 +789,27 @@ private:
             // receives the events asynchronously.
             MIDIReceived(mVirtualSource, pktList);
         }
+    }
+
+    /// Force-emit a clean stop. Drains Rust's pending note_offs for any
+    /// sounding notes (so the recording region captures them in-bounds)
+    /// and follows up with all-notes-off CC123 on both channels as a
+    /// safety belt. Called from ProcessBufferLists on the playing→stopped
+    /// transport edge — runs on the audio thread, must stay realtime-safe
+    void panicFlush() AUSDK_RTSAFE
+    {
+        if (mBebop != nullptr) {
+            BebopMidiEvent buf[64];
+            const size_t got = bebop_panic_flush(mBebop, buf, 64);
+            for (size_t i = 0; i < got; ++i) {
+                mMidiQueue.push({buf[i].status, buf[i].pitch,
+                                  buf[i].velocity, 0});
+            }
+        }
+        // All-notes-off CC123 (data2=0) on piano (ch0) + bass (ch1).
+        // Realtime-safe: just two queue pushes
+        mMidiQueue.push({0xB0, 123, 0, 0});
+        mMidiQueue.push({0xB1, 123, 0, 0});
     }
 
     /// Open a CoreMIDI virtual source named "Bebop AU" so any DAW (Logic,
@@ -1142,6 +1174,9 @@ private:
     std::atomic<int>      mTransportFlags    { 0 };
     std::atomic<double>   mCycleStartBeat    { 0.0 };
     std::atomic<double>   mCycleEndBeat      { 0.0 };
+    // Previous block's isPlaying — used for playing→stopped edge detection
+    // so we can panic-flush note_offs into the recording region in-bounds
+    std::atomic<bool>     mWasPlaying        { false };
 
     // musical time location — time signature + current downbeat.
     // Used to translate between sample-time and beat-time for the

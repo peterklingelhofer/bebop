@@ -99,10 +99,17 @@ def comp_for_chord(
     def shift(p: int) -> int:
         return max(0, min(127, int(p) + semis))
 
-    # Bass: one sustained note for the whole duration.
+    # Bass: sustain until the next chord change (no fixed duration). We
+    # schedule the note_off effectively at infinity; the FFI's cancel-on-
+    # commit logic forces a real release the moment the next chord lands,
+    # and the AU's transport-stop panic flush handles it on stop. This
+    # avoids two failure modes the fixed-duration approach had:
+    #   - bass tail outlasting the chord (long silence on the next attack)
+    #   - bass cutting short before the next chord (gap in the bass line)
+    _BASS_HOLD_SECONDS = 86_400.0  # one day, practical infinity
     bass_pitch_shifted = shift(v.bass_pitch)
     bass_start = shift_beats * spb
-    bass_end = bass_start + chord_duration_beats * spb
+    bass_end = bass_start + _BASS_HOLD_SECONDS
     if bass_start >= 0:
         events.append((bass_start, 0x90 | _BASS_CH, bass_pitch_shifted, 80))
         events.append((bass_end,   0x80 | _BASS_CH, bass_pitch_shifted, 0))
