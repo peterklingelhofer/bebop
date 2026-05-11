@@ -126,6 +126,22 @@ def comp_for_chord(
                 events.append((hit_start, 0x90 | _PIANO_CH, p, int(hit.velocity)))
                 events.append((hit_end,   0x80 | _PIANO_CH, p, 0))
 
+    # Pull every note_off back by a small gap so it always lands strictly
+    # before the next note_on of the same pitch. Without this, rhythm
+    # templates whose hit_end equals the next hit_start (e.g. bossa
+    # with hits at 0.0/1.5/3.0 + durations 1.5/1.0/1.0 — hit1.off and
+    # hit2.on both hit at 1.5 beats) generate same-timestamp note_off
+    # /note_on pairs. Receiving instruments may apply note_on first
+    # and the trailing note_off then cancels the new note, leaving the
+    # voice silent. 5 ms is well below note-perception threshold but
+    # comfortably above any host's MIDI scheduling resolution
+    _NOTE_OFF_GAP_SECONDS = 0.005
+    events = [
+        (max(0.0, t - _NOTE_OFF_GAP_SECONDS), s, p, v)
+        if (s & 0xF0) == 0x80
+        else (t, s, p, v)
+        for (t, s, p, v) in events
+    ]
     events.sort(key=lambda e: e[0])
     # Return the un-shifted pitches as the "voicing" — this is what gets
     # threaded back as `prev_*` for voice-leading on the next call. Voice

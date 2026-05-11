@@ -75,6 +75,16 @@ struct BebopState {
     /// `due_at`. The C++ side polls `bebop_pull_midi_events` to drain
     /// events whose deadline has passed.
     pending: VecDeque<PendingMidiEvent>,
+    /// Pending events scheduled by host beat (used when `rhythm_sync` is
+    /// on). The C++ worker drains these unconditionally via
+    /// `bebop_drain_beat_events` and forwards into a lockfree SPSC
+    /// queue; the audio thread maintains the time-sorted view and emits
+    /// when current_beat crosses each event's `due_at_beat`
+    pending_beat: VecDeque<PendingBeatEvent>,
+    /// Monotonic counter incremented on every comp burst. Tagged onto
+    /// emitted beat events so the audio thread can cheaply discard a
+    /// previous chord's stale events when a new chord lands
+    comp_gen: u32,
     /// Current knob values (writable from C++ via bebop_set_param).
     bpm: f32,
     voicing: String,
@@ -83,6 +93,29 @@ struct BebopState {
     /// Octave shift for emitted MIDI pitches; applied at comp generation.
     /// Range typically -3..+3.
     octave_shift: i32,
+    /// When true, comp events are delayed to align with the host's bar
+    /// grid instead of firing at chord-onset wall-clock. Updated by the
+    /// AU param surface; consumed at comp-generation time
+    rhythm_sync: bool,
+    /// Latest host beat snapshot pushed by the AU shell. Used (with
+    /// `taken_at`) to extrapolate the current host beat at comp time
+    /// for bar-grid alignment when `rhythm_sync` is on
+    host_beat: Option<HostBeat>,
+    /// Voicing-update queue for sync mode. Comp generation pushes the
+    /// just-computed voicing here; the AU's worker drains it via
+    /// `bebop_drain_voicing_updates` and forwards to the audio thread,
+    /// which uses it to emit current-voicing pitches at each rhythm hit
+    voicing_pending: VecDeque<PendingVoicing>,
+    /// Monotonic gen counter for voicing updates (lets the audio thread
+    /// detect "no new voicing" cheaply)
+    voicing_gen: u32,
+}
+
+#[derive(Clone, Copy)]
+struct HostBeat {
+    beat: f64,
+    bpm: f64,
+    taken_at: Instant,
 }
 
 #[derive(Clone)]
@@ -91,6 +124,54 @@ struct PendingMidiEvent {
     status: u8,
     pitch: u8,
     velocity: u8,
+}
+
+/// Voicing snapshot enqueued on each comp commit when sync mode is on.
+/// The AU shell's worker drains these and forwards to the audio thread,
+/// which uses them to emit current-voicing pitches at each rhythm hit
+#[derive(Clone)]
+struct PendingVoicing {
+    bass_pitch: i32,        // -1 if no bass
+    chord_pitches: Vec<u8>, // 0..7 pitches typically
+    gen_id: u32,
+}
+
+/// C-ABI mirror of [`PendingVoicing`]. Layout MUST match `BebopVoicing`
+/// in `include/bebop_rs.h`. Fixed-size buffer (7 pitches max + 1 pad)
+/// keeps the FFI struct trivially copyable. 16 bytes total
+#[repr(C)]
+pub struct CBebopVoicing {
+    pub gen_id:      u32,    // monotonic; advances on each comp commit
+    pub bass_pitch:  i8,     // -1 if no bass
+    pub pitch_count: u8,     // 0..7
+    pub _pad:        [u8; 2],
+    pub pitches:     [u8; 8], // up to 7 used; pitch_count is authoritative
+}
+
+#[derive(Clone)]
+struct PendingBeatEvent {
+    due_at_beat: f64,
+    status: u8,
+    pitch: u8,
+    velocity: u8,
+    /// Comp-burst generation id. The C++ audio thread tracks the highest
+    /// gen it's seen and discards any locally-buffered events from older
+    /// gens — this is how we cancel a previous chord's beat-scheduled
+    /// events without locking the audio thread on the Rust mutex
+    gen_id: u32,
+}
+
+/// C-ABI mirror of [`PendingBeatEvent`]. Layout MUST match the
+/// `BebopBeatEvent` struct in `include/bebop_rs.h`. 24 bytes
+/// (struct alignment forces an 8-byte gap before due_at_beat)
+#[repr(C)]
+pub struct CBebopBeatEvent {
+    pub status: u8,
+    pub pitch: u8,
+    pub velocity: u8,
+    pub _pad: u8,
+    pub gen_id: u32,
+    pub due_at_beat: f64,
 }
 
 /// Mirror of the C struct returned to the C++ side. The fields and layout
@@ -110,6 +191,47 @@ const ANALYSIS_PERIOD_SECONDS: f32 = 0.3;
 /// new chord. Higher = more stable but adds (N-1) * ANALYSIS_PERIOD to
 /// total recognition latency. Eval bench shows N=3 → ~100% triad accuracy.
 const STABILITY_FRAMES: u32 = 3;
+
+/// Bar length in beats. 4/4 only for now (matches everywhere else)
+const BEATS_PER_BAR: f64 = 4.0;
+
+/// Worker→audio handoff lag estimate, in beats. Conservatively covers
+/// `bebop_drain_beat_events` poll latency (~100 ms) + audio block
+/// latency (~12 ms) at the slowest realistic project tempo. Used as a
+/// safety margin in [`sync_beat_anchor`] so the anchor we pick can't
+/// slip into the past by audio fire time.
+///
+/// At 60 BPM, 0.5 beats = 500 ms of headroom. At 240 BPM, 0.5 beats =
+/// 125 ms. Either way well above worker poll latency
+const ANCHOR_SAFETY_BEATS: f64 = 0.5;
+
+/// Compute the bar-aligned anchor beat at which the next comp should
+/// start. Returns `Some(anchor_beat)` when sync is on AND we have a
+/// usable host-beat snapshot, else `None` (caller falls back to
+/// wall-clock scheduling).
+///
+/// Uses ONLY host-beat math (no PDC subtraction) — the audio thread
+/// fires beat-scheduled events when current_beat crosses each event's
+/// due_at_beat, so timing accuracy is bounded by the audio thread, not
+/// by the worker poll cadence
+fn sync_beat_anchor(
+    rhythm_sync: bool,
+    host_beat: Option<HostBeat>,
+) -> Option<f64> {
+    if !rhythm_sync { return None; }
+    let hb = host_beat?;
+    if hb.bpm <= 0.0 { return None; }
+    let spb = 60.0 / hb.bpm;
+    let now_beat = hb.beat + hb.taken_at.elapsed().as_secs_f64() / spb;
+    // Next bar boundary at or after (now + safety). The safety margin
+    // absorbs worker→audio propagation lag — without it, an anchor
+    // computed right before a bar boundary can land in the audio
+    // thread's past, causing the comp to fire immediately at sample
+    // offset 0 instead of waiting for the next clean bar
+    let target = now_beat + ANCHOR_SAFETY_BEATS;
+    let next_bar_beat = (target / BEATS_PER_BAR).ceil() * BEATS_PER_BAR;
+    Some(next_bar_beat)
+}
 
 thread_local! {
     /// Buffer for the most recent error message from this thread, kept
@@ -160,11 +282,17 @@ pub extern "C" fn bebop_init() -> *mut BebopHandle {
                     last_voicing_bass: None,
                     last_voicing_pitches: None,
                     pending: VecDeque::new(),
+                    pending_beat: VecDeque::new(),
+                    comp_gen: 0,
                     bpm: 120.0,
                     voicing: "rootless".to_string(),
                     rhythm: "charleston".to_string(),
                     spice: 0.0,
                     octave_shift: 0,
+                    rhythm_sync: false,
+                    host_beat: None,
+                    voicing_pending: VecDeque::new(),
+                    voicing_gen: 0,
                 }),
             });
             Box::into_raw(handle)
@@ -371,36 +499,34 @@ pub unsafe extern "C" fn bebop_process_audio(
                 let mut state = handle.state.lock().expect("BebopHandle state lock");
                 let now = Instant::now();
 
-                // Cancel previous chord's still-pending events. For
-                // note_offs from the previous chord we have two cases:
+                // Cancel previous chord's still-pending events. Two cases
+                // per pending note_off:
                 //
-                //   - Matching note_on STILL in pending → both haven't
+                //   - Matching note_on STILL in pending → neither has
                 //     fired yet. The note never sounded. Drop both.
                 //   - Matching note_on already drained → the note IS
                 //     currently sounding (note_on fired, note_off in
-                //     the future). We force the note_off to fire NOW
-                //     so the previous chord's bass / piano notes don't
-                //     ring through the new chord's start. Without this,
-                //     bass notes (which last for 16 beats by default)
-                //     pile up across chord changes
-                let old: Vec<PendingMidiEvent> =
+                //     the future). Force the note_off to fire NOW so
+                //     the previous chord's bass / piano notes don't ring
+                //     through the new chord's start
+                //
+                // We collapse beat-scheduled cancellations into wall-clock
+                // immediate releases so they fire right away regardless of
+                // the host's beat position — note_off should never wait
+                let old_wall: Vec<PendingMidiEvent> =
                     state.pending.drain(..).collect();
+                let old_beat: Vec<PendingBeatEvent> =
+                    state.pending_beat.drain(..).collect();
                 let mut next_pending: VecDeque<PendingMidiEvent> =
                     VecDeque::new();
-                for ev in &old {
-                    if (ev.status & 0xF0) != 0x80 {
-                        continue; // drop note_ons + others on cancel
-                    }
-                    let on_still_pending = old.iter().any(|other| {
+                for ev in &old_wall {
+                    if (ev.status & 0xF0) != 0x80 { continue; }
+                    let on_still_pending = old_wall.iter().any(|other| {
                         (other.status & 0xF0) == 0x90
                             && (other.status & 0x0F) == (ev.status & 0x0F)
                             && other.pitch == ev.pitch
                     });
-                    if on_still_pending {
-                        // note never sounded — drop the off too
-                        continue;
-                    }
-                    // note is currently sounding — force release now
+                    if on_still_pending { continue; }
                     next_pending.push_back(PendingMidiEvent {
                         due_at: now,
                         status: ev.status,
@@ -408,21 +534,68 @@ pub unsafe extern "C" fn bebop_process_audio(
                         velocity: ev.velocity,
                     });
                 }
-                // Append fresh comp events
-                for (t_seconds, status, pitch, vel) in c.events {
+                for ev in &old_beat {
+                    if (ev.status & 0xF0) != 0x80 { continue; }
+                    let on_still_pending = old_beat.iter().any(|other| {
+                        (other.status & 0xF0) == 0x90
+                            && (other.status & 0x0F) == (ev.status & 0x0F)
+                            && other.pitch == ev.pitch
+                    });
+                    if on_still_pending { continue; }
                     next_pending.push_back(PendingMidiEvent {
-                        due_at: now + Duration::from_secs_f64(t_seconds.max(0.0)),
-                        status,
-                        pitch,
-                        velocity: vel,
+                        due_at: now,
+                        status: ev.status,
+                        pitch: ev.pitch,
+                        velocity: ev.velocity,
                     });
                 }
-                // Sort by deadline so the cancel-offs ride out before
-                // the new chord's note_ons (next_pending may have
-                // mixed deadlines due to the immediate-release logic).
-                let mut as_vec: Vec<PendingMidiEvent> = next_pending.into();
-                as_vec.sort_by_key(|e| e.due_at);
-                state.pending = as_vec.into();
+
+                // Schedule the new chord's events. If sync is on AND we
+                // have a host-beat snapshot, route through pending_beat
+                // (audio thread emits sample-accurately). Otherwise use
+                // the wall-clock pending queue (existing behavior).
+                let beat_anchor = sync_beat_anchor(
+                    state.rhythm_sync, state.host_beat);
+                if let Some(_anchor_beat) = beat_anchor {
+                    // Sync mode: the audio thread drives rhythm hits from
+                    // the rhythm template + current voicing. Rust just
+                    // publishes the latest voicing — no per-event
+                    // scheduling. This decouples chord recognition from
+                    // rhythm timing: a chord change updates "what plays
+                    // on the next hit" without disturbing the rhythm phase
+                    //
+                    // Drop any wall-clock note_off cancels we collected
+                    // (the audio thread emits its own note_offs at each
+                    // hit transition based on what it's currently
+                    // playing) — keeping them would double-release notes
+                    next_pending.clear();
+                    state.pending.clear();
+                    state.pending_beat.clear();
+
+                    state.voicing_gen = state.voicing_gen.wrapping_add(1);
+                    let gen_id = state.voicing_gen;
+                    state.voicing_pending.push_back(PendingVoicing {
+                        bass_pitch: c.bass_pitch,
+                        chord_pitches: c.chord_pitches.iter()
+                            .map(|&p| (p as i32).clamp(0, 127) as u8)
+                            .collect(),
+                        gen_id,
+                    });
+                } else {
+                    // Wall-clock path (current behavior)
+                    for (t_seconds, status, pitch, vel) in c.events {
+                        next_pending.push_back(PendingMidiEvent {
+                            due_at: now + Duration::from_secs_f64(
+                                t_seconds.max(0.0)),
+                            status,
+                            pitch,
+                            velocity: vel,
+                        });
+                    }
+                    let mut as_vec: Vec<PendingMidiEvent> = next_pending.into();
+                    as_vec.sort_by_key(|e| e.due_at);
+                    state.pending = as_vec.into();
+                }
                 state.last_voicing_bass = Some(c.bass_pitch);
                 state.last_voicing_pitches = Some(c.chord_pitches);
                 state.last_comped_chord = Some(chord);
@@ -583,16 +756,13 @@ pub unsafe extern "C" fn bebop_pull_midi_events(
     count
 }
 
-/// Panic-flush: drain ALL pending events, returning note_offs for any notes
-/// that are currently sounding (note_on already drained, note_off still
-/// pending). Note_offs whose paired note_on hasn't fired yet are dropped
-/// (the note never sounded — no need to release it).
+/// Panic-flush: drain ALL pending events (wall-clock AND beat-scheduled),
+/// returning note_offs for any currently-sounding notes (note_on already
+/// drained, note_off still pending). Note_offs whose paired note_on hasn't
+/// fired yet are dropped (the note never sounded — no need to release it).
 ///
 /// Called by the AU shell on transport-stop edge so the recording region
-/// captures real note_offs before Logic stops capturing. Without this, a
-/// note_on near the end of the region pairs with a note_off scheduled
-/// after stop, and Logic's recorded MIDI shows the note hanging to the
-/// end of the region.
+/// captures real note_offs before Logic stops capturing.
 ///
 /// # Safety
 /// `out` must point to at least `max_events` `CBebopMidiEvent` slots.
@@ -610,33 +780,128 @@ pub unsafe extern "C" fn bebop_panic_flush(
         Ok(s) => s,
         Err(_) => return 0,
     };
-    let old: Vec<PendingMidiEvent> = state.pending.drain(..).collect();
+    let old_wall: Vec<PendingMidiEvent> = state.pending.drain(..).collect();
+    let old_beat: Vec<PendingBeatEvent> = state.pending_beat.drain(..).collect();
     let mut count = 0;
-    for ev in &old {
-        if (ev.status & 0xF0) != 0x80 {
-            continue; // skip note_ons (and any non-note_off)
-        }
-        let on_still_pending = old.iter().any(|other| {
+
+    let mut emit = |status: u8, pitch: u8, velocity: u8| {
+        if count >= max_events { return false; }
+        let dst = out.add(count);
+        (*dst).status = status;
+        (*dst).pitch = pitch;
+        (*dst).velocity = velocity;
+        (*dst)._pad = 0;
+        count += 1;
+        true
+    };
+
+    for ev in &old_wall {
+        if (ev.status & 0xF0) != 0x80 { continue; }
+        let on_still_pending = old_wall.iter().any(|other| {
             (other.status & 0xF0) == 0x90
                 && (other.status & 0x0F) == (ev.status & 0x0F)
                 && other.pitch == ev.pitch
         });
-        if on_still_pending {
-            continue; // note_on never fired — its note_off is moot
-        }
-        if count >= max_events {
-            break;
-        }
+        if on_still_pending { continue; }
+        if !emit(ev.status, ev.pitch, ev.velocity) { break; }
+    }
+    for ev in &old_beat {
+        if (ev.status & 0xF0) != 0x80 { continue; }
+        let on_still_pending = old_beat.iter().any(|other| {
+            (other.status & 0xF0) == 0x90
+                && (other.status & 0x0F) == (ev.status & 0x0F)
+                && other.pitch == ev.pitch
+        });
+        if on_still_pending { continue; }
+        if !emit(ev.status, ev.pitch, ev.velocity) { break; }
+    }
+    // last_comped_chord stays set so we don't immediately re-comp the same
+    // chord on play resume; the new chord recognition cycle will pick up
+    // naturally
+    count
+}
+
+/// Drain ALL pending beat-scheduled events. Each event carries its
+/// `due_at_beat` and a `gen_id` (comp-burst generation counter — the
+/// audio thread uses this to discard stale events from a previous chord
+/// without locking).
+///
+/// The audio thread is the only one that knows the host beat at sample
+/// resolution, so it owns the firing decision; this FFI just transports
+/// the schedule across the worker→audio boundary
+///
+/// # Safety
+/// `out` must point to at least `max_events` `CBebopBeatEvent` slots.
+#[no_mangle]
+pub unsafe extern "C" fn bebop_drain_beat_events(
+    handle: *mut BebopHandle,
+    out: *mut CBebopBeatEvent,
+    max_events: usize,
+) -> usize {
+    if handle.is_null() || out.is_null() || max_events == 0 {
+        return 0;
+    }
+    let handle: &BebopHandle = &*handle;
+    let mut state = match handle.state.lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut count = 0;
+    while count < max_events {
+        let Some(ev) = state.pending_beat.pop_front() else { break; };
         let dst = out.add(count);
         (*dst).status = ev.status;
         (*dst).pitch = ev.pitch;
         (*dst).velocity = ev.velocity;
         (*dst)._pad = 0;
+        (*dst).gen_id = ev.gen_id;
+        (*dst).due_at_beat = ev.due_at_beat;
         count += 1;
     }
-    // last_comped_chord stays set so we don't immediately re-comp the same
-    // chord on play resume; the new chord recognition cycle will pick up
-    // naturally
+    count
+}
+
+/// Drain ALL pending voicing updates. Each carries the bass + chord
+/// pitches a comp commit just produced, plus a monotonic gen id. The
+/// AU's worker drains via this and forwards into a SPSC the audio
+/// thread reads — the audio thread keeps the latest voicing as
+/// "current" and emits its pitches at every rhythm hit.
+///
+/// Used only when Rhythm Sync is on; in free mode comp generation
+/// schedules events directly via `bebop_pull_midi_events`.
+///
+/// # Safety
+/// `out` must point to at least `max_events` `CBebopVoicing` slots.
+#[no_mangle]
+pub unsafe extern "C" fn bebop_drain_voicing_updates(
+    handle: *mut BebopHandle,
+    out: *mut CBebopVoicing,
+    max_events: usize,
+) -> usize {
+    if handle.is_null() || out.is_null() || max_events == 0 {
+        return 0;
+    }
+    let handle: &BebopHandle = &*handle;
+    let mut state = match handle.state.lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut count = 0;
+    while count < max_events {
+        let Some(v) = state.voicing_pending.pop_front() else { break; };
+        let dst = out.add(count);
+        (*dst).gen_id      = v.gen_id;
+        (*dst).bass_pitch  = v.bass_pitch.clamp(-1, 127) as i8;
+        let n = v.chord_pitches.len().min(7);
+        (*dst).pitch_count = n as u8;
+        for i in 0..7 { (*dst).pitches[i] = 0; }
+        (*dst).pitches[7]  = 0;
+        for i in 0..n {
+            (*dst).pitches[i] = v.chord_pitches[i];
+        }
+        (*dst)._pad = [0; 2];
+        count += 1;
+    }
     count
 }
 
@@ -654,6 +919,11 @@ pub enum BebopParam {
     /// shifts up, negative down. Clamped at the Python helper to keep
     /// pitches in [0..127].
     OctaveShift = 4,
+    /// When non-zero, comp events are delayed to land on the host's bar
+    /// boundary instead of firing at chord-onset wall-clock. Requires
+    /// `bebop_set_host_beat` to be called periodically with current
+    /// host beat info.
+    RhythmSync = 5,
 }
 
 /// Set a knob value. `param` is one of `BebopParam`'s values cast to int.
@@ -710,8 +980,36 @@ pub unsafe extern "C" fn bebop_set_param(
             state.octave_shift = (value as i32).clamp(-3, 3);
             0
         }
+        5 => {
+            state.rhythm_sync = value > 0.5;
+            0
+        }
         _ => -2,
     }
+}
+
+/// Push the host's current beat position into the FFI so the bar-grid
+/// alignment logic can extrapolate the current beat at comp-generation
+/// time. The AU shell calls this from the worker thread once per poll
+/// using its cached `mBeatLastValue` + tempo. No-op when handle is null.
+#[no_mangle]
+pub unsafe extern "C" fn bebop_set_host_beat(
+    handle: *mut BebopHandle,
+    beat: f64,
+    bpm: f64,
+) -> c_int {
+    if handle.is_null() { return -1; }
+    let handle: &BebopHandle = &*handle;
+    let mut state = match handle.state.lock() {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    state.host_beat = Some(HostBeat {
+        beat,
+        bpm,
+        taken_at: Instant::now(),
+    });
+    0
 }
 
 /// Run one chord-recognition pass on a flat audio buffer. Returns

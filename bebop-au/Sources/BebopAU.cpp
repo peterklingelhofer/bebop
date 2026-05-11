@@ -22,6 +22,7 @@
 #include <AudioUnitSDK/ComponentBase.h>
 #include <AudioToolbox/AudioUnitUtilities.h>   // AUEventListenerNotify
 #include <CoreMIDI/CoreMIDI.h>
+#include <mach/mach_time.h>
 #include <os/log.h>
 
 #include <bebop_rs.h>
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "AudioRingBuffer.h"
+#include "RhythmTemplates.h"
 
 /// Unified-logging handle. Logs filed under subsystem "com.bebop.au"
 /// — visible in Console.app by filtering "Subsystem: com.bebop.au".
@@ -144,6 +146,8 @@ public:
         kBebopParamLoopMode   = 7,  // 0=off, 1=auto, 2=manual
         kBebopParamLoopBars   = 8,  // 0..5: 1, 2, 4, 8, 16, 32 bars
         kBebopParamCompOffset = 9,  // beats: shift recorded comp earlier (negative)
+        kBebopParamRhythmSync = 10, // 0=free (chord-onset), 1=sync to host bars
+        kBebopParamBarOffset  = 11, // beats: manual anchor compensation for hosts whose downbeat reporting needs tuning
         kBebopParamCount,
     };
 
@@ -183,6 +187,12 @@ public:
         // MIDI queue: 1024 events is plenty — even a bar of charleston
         // comp at 8th notes generates <50 events.
         , mMidiQueue(1024)
+        // Beat-scheduled inbox (worker→audio). Same capacity for the
+        // same reason — comp bursts are small + infrequent
+        , mBeatInbox(1024)
+        // Voicing inbox for the rhythm-driven sync path. Capacity 64 is
+        // generous — voicing changes ~1 Hz at most
+        , mVoicingInbox(64)
     {
         Globals()->UseIndexedParameters(kBebopParamCount);
         Globals()->SetParameter(kBebopParamSpice,      0.4f);
@@ -195,6 +205,8 @@ public:
         Globals()->SetParameter(kBebopParamLoopMode,   0.0f);  // off — PDC handles alignment
         Globals()->SetParameter(kBebopParamLoopBars,   2.0f);  // 4 bars (only used in manual mode)
         Globals()->SetParameter(kBebopParamCompOffset, 0.0f);  // PDC handles alignment
+        Globals()->SetParameter(kBebopParamRhythmSync, 0.0f);  // off — comp at chord onset
+        Globals()->SetParameter(kBebopParamBarOffset,  0.0f);  // beats: no manual offset by default
 
         // Boot the embedded Python interpreter via bebop-rs. This is
         // moderately expensive (~100ms cold) but happens at AU
@@ -217,6 +229,7 @@ public:
             bebop_set_param(mBebop, /*Rhythm*/ 2,   3.0);
             bebop_set_param(mBebop, /*Spice*/  3,   0.4);
             bebop_set_param(mBebop, /*Octave*/ 4,   0.0);
+            bebop_set_param(mBebop, /*RhythmSync*/ 5, 0.0);
         }
     }
 
@@ -393,6 +406,29 @@ public:
             // the-beat groove.
             outParameterInfo.defaultValue = 0.0f;
             return noErr;
+        case kBebopParamRhythmSync:
+            ausdk::AUBase::FillInParameterName(
+                outParameterInfo, CFSTR("Rhythm Sync"), false);
+            outParameterInfo.unit         = kAudioUnitParameterUnit_Indexed;
+            outParameterInfo.minValue     = 0.0f;
+            outParameterInfo.maxValue     = 1.0f;
+            // Off: comp fires at chord onset (current behavior).
+            // On: comp delayed to next host bar boundary so the rhythm
+            // pattern stays locked to the DAW grid regardless of when
+            // the chord was detected
+            outParameterInfo.defaultValue = 0.0f;
+            return noErr;
+        case kBebopParamBarOffset:
+            ausdk::AUBase::FillInParameterName(
+                outParameterInfo, CFSTR("Bar Offset"), false);
+            outParameterInfo.unit         = kAudioUnitParameterUnit_Beats;
+            outParameterInfo.minValue     = -4.0f;
+            outParameterInfo.maxValue     =  4.0f;
+            // Beats to add to the rhythm-sync bar anchor. 0 = use host's
+            // reported downbeat directly. Use negative values when hits
+            // land late on the grid, positive when early
+            outParameterInfo.defaultValue = 0.0f;
+            return noErr;
         }
         return kAudioUnitErr_InvalidParameter;
     }
@@ -417,6 +453,7 @@ public:
             case kBebopParamLastChord:
             case kBebopParamLoopMode:
             case kBebopParamLoopBars:
+            case kBebopParamRhythmSync:
                 return noErr;
             default:
                 return kAudioUnitErr_InvalidProperty;
@@ -489,6 +526,12 @@ public:
                                           &kCFTypeArrayCallBacks);
             return noErr;
         }
+        case kBebopParamRhythmSync: {
+            CFStringRef names[] = { CFSTR("free"), CFSTR("sync to bars") };
+            *outStrings = CFArrayCreate(nullptr, (const void**)names, 2,
+                                          &kCFTypeArrayCallBacks);
+            return noErr;
+        }
         }
         return kAudioUnitErr_InvalidProperty;
     }
@@ -511,11 +554,12 @@ public:
             // to line up — be explicit).
             int bebopParam = -1;
             switch (inID) {
-            case kBebopParamSpice:   bebopParam = 3; break;
-            case kBebopParamVoicing: bebopParam = 1; break;
-            case kBebopParamRhythm:  bebopParam = 2; break;
-            case kBebopParamBpm:     bebopParam = 0; break;
-            case kBebopParamOctave:  bebopParam = 4; break;
+            case kBebopParamSpice:      bebopParam = 3; break;
+            case kBebopParamVoicing:    bebopParam = 1; break;
+            case kBebopParamRhythm:     bebopParam = 2; break;
+            case kBebopParamBpm:        bebopParam = 0; break;
+            case kBebopParamOctave:     bebopParam = 4; break;
+            case kBebopParamRhythmSync: bebopParam = 5; break;
             // SyncBpm and LastChord have no bebop-rs equivalent — they
             // live entirely in the AU layer.
             }
@@ -601,6 +645,27 @@ public:
         }
         return AUEffectBase::SetProperty(
             inID, inScope, inElement, inData, inDataSize);
+    }
+
+    /// Capture the host's intended HostTime for the buffer's first
+    /// frame BEFORE delegating to AUEffectBase::Render. Used as the
+    /// reference for our outgoing MIDI packet timestamps so they line
+    /// up with the audio at the speakers — mach_absolute_time() on its
+    /// own corresponds to "wall clock when the audio thread is rendering",
+    /// which is one buffer + device-output latency EARLIER than when the
+    /// buffer is actually heard. inTimeStamp.mHostTime is the right
+    /// reference for "when this audio plays", which is also when the
+    /// host records the receipt-time of corresponding MIDI
+    OSStatus Render(AudioUnitRenderActionFlags& ioActionFlags,
+                     const AudioTimeStamp& inTimeStamp,
+                     UInt32 nFrames) AUSDK_RTSAFE override
+    {
+        if (inTimeStamp.mFlags & kAudioTimeStampHostTimeValid) {
+            mLastHostTime.store(inTimeStamp.mHostTime,
+                std::memory_order_relaxed);
+            mLastHostTimeValid.store(true, std::memory_order_relaxed);
+        }
+        return AUEffectBase::Render(ioActionFlags, inTimeStamp, nFrames);
     }
 
     /// Render entry point — runs on the realtime audio thread. We chain
@@ -722,8 +787,226 @@ public:
         if (status != noErr) {
             return status;
         }
+        // Schedule sample-accurate MIDI for THIS block before flushing.
+        // Two paths depending on Rhythm Sync:
+        //   - On  : drive rhythm hits from the rhythm template + current
+        //           voicing (audio-thread phase-locked to host bars)
+        //   - Off : legacy beat-event drain (kept for transitional
+        //           compatibility; not exercised by free mode)
+        if (transportStatus == noErr && tempo > 0.0 && isPlaying) {
+            const double sr = GetSampleRate();
+            const bool syncOn =
+                Globals()->GetParameter(kBebopParamRhythmSync) > 0.5f;
+            if (syncOn) {
+                scheduleRhythmHits(beat, tempo, sr, inFramesToProcess);
+            } else {
+                scheduleBeatEvents(beat, tempo, sr, inFramesToProcess);
+            }
+        }
         flushMidi(inFramesToProcess);
         return noErr;
+    }
+
+    /// Phase-locked sync mode: drive rhythm hits at sample-accurate
+    /// host-beat positions using the rhythm template + the current
+    /// voicing. Each hit emits note_offs for the previously-sounding
+    /// piano pitches followed by note_ons for the current voicing's
+    /// chord pitches. Bass changes only when the voicing's bass changes.
+    /// Chord recognition's commits arrive via `mVoicingInbox` and
+    /// update `mCurrentVoicing` — they never disturb the rhythm phase
+    void scheduleRhythmHits(double blockStartBeat, double tempo,
+                             double sampleRate, UInt32 frames) AUSDK_RTSAFE
+    {
+        // Pull every queued voicing update; keep only the latest
+        bebop::Voicing v;
+        bool voicingChanged = false;
+        while (mVoicingInbox.pop(v)) {
+            if (v.genId > mCurrentVoicing.genId) {
+                mCurrentVoicing = v;
+                voicingChanged = true;
+            }
+        }
+        // On chord change: emit immediate note_offs for any sounding
+        // pitches RIGHT NOW (sampleOffset=0 in this block) so the old
+        // harmony doesn't keep ringing into the new chord's territory.
+        // The next rhythm hit will play the new voicing fresh
+        if (voicingChanged) {
+            for (uint8_t p : mPlayingChordPitches) {
+                mMidiQueue.push({0x80, p, 0, 0});
+            }
+            mPlayingChordPitches.clear();
+            if (mPlayingBass >= 0) {
+                mMidiQueue.push({0x81, (uint8_t)mPlayingBass, 0, 0});
+                mPlayingBass = -1;
+            }
+        }
+        if (mCurrentVoicing.pitchCount == 0) return; // no voicing yet
+
+        // Resolve the rhythm template from the AU param. Indices match
+        // kBebopParamRhythm value-strings + bebop.rhythm.all_rhythm_names()
+        const int rhythmIdx = static_cast<int>(
+            Globals()->GetParameter(kBebopParamRhythm) + 0.5f);
+        const auto* tmpl = bebop::lookupTemplate(static_cast<size_t>(rhythmIdx));
+        if (tmpl == nullptr) return;
+
+        const double beatsPerSec = tempo / 60.0;
+        const double blockSec    = double(frames) / sampleRate;
+        const double blockEndBeat = blockStartBeat + blockSec * beatsPerSec;
+        const double secPerBeat  = 60.0 / tempo;
+        // 5 ms is well above any host's MIDI scheduling resolution and
+        // well below note-perception threshold; ensures note_off lands
+        // strictly before its replacement note_on
+        const uint32_t fiveMsSamples =
+            static_cast<uint32_t>(0.005 * sampleRate);
+
+        // Bar anchor: use the host's reported "current measure downbeat"
+        // when available — this is the master beat of the most recent
+        // bar boundary IN PROJECT TERMS, accounting for pre-roll, song
+        // start offset, time-signature changes, etc. floor(beat/4)*4
+        // assumes bars start at master beat 0 which is wrong in any
+        // Logic project that doesn't begin exactly at "1 1 1 1" with
+        // zero pre-roll. With Logic's typical setup, that put our bars
+        // at master beat 2.357 / 6.357 / ... while the project's
+        // own bars were at 0 / 4 / 8 / ..., so the rhythm landed
+        // off-grid by ~half a bar
+        const int musStat = mMusicalTimeStatus.load(std::memory_order_relaxed);
+        const double hostDownbeat =
+            mCurrentDownbeat.load(std::memory_order_relaxed);
+        // Fallback to floor() if host didn't fill in a downbeat
+        double currentBarStart =
+            (musStat == noErr && hostDownbeat <= blockStartBeat + 0.001)
+                ? hostDownbeat
+                : std::floor(blockStartBeat / 4.0) * 4.0;
+        // User-tunable bar anchor offset. Shifts the rhythm grid by N
+        // beats — for hosts whose downbeat reporting is offset from the
+        // recorded MIDI position by some constant (e.g. Logic with PDC
+        // declared). Default 0; user dials in until hits land on grid
+        const double barOffset =
+            Globals()->GetParameter(kBebopParamBarOffset);
+        currentBarStart += barOffset;
+        for (int barIdx = 0; barIdx <= 1; ++barIdx) {
+            const double barStart = currentBarStart + barIdx * 4.0;
+            if (barStart >= blockEndBeat) break;
+
+            for (size_t hi = 0; hi < tmpl->count; ++hi) {
+                const auto& hit = tmpl->hits[hi];
+                // Apply whole-template shift, mod 4 so the shifted
+                // version still tiles to a 4-beat bar
+                double offsetInBar = hit.offsetBeats + tmpl->shiftBeats;
+                offsetInBar = std::fmod(offsetInBar, 4.0);
+                if (offsetInBar < 0) offsetInBar += 4.0;
+                const double hitBeat = barStart + offsetInBar;
+                if (hitBeat <  blockStartBeat) continue;
+                if (hitBeat >= blockEndBeat)   continue;
+
+                // Hit falls in this block — compute sample offset
+                const double hitOffsetSec =
+                    (hitBeat - blockStartBeat) * secPerBeat;
+                uint32_t hitSample =
+                    static_cast<uint32_t>(hitOffsetSec * sampleRate);
+                if (hitSample >= frames) hitSample = frames - 1;
+                const uint32_t offSample =
+                    hitSample > fiveMsSamples ? hitSample - fiveMsSamples : 0;
+
+                // Note_offs for whatever's currently sounding on piano
+                for (uint8_t p : mPlayingChordPitches) {
+                    mMidiQueue.push({0x80, p, 0, offSample});
+                }
+                mPlayingChordPitches.clear();
+
+                // Bass swap (only if it changed) — bass channel = 1
+                const int newBass = mCurrentVoicing.bassPitch;
+                if (newBass >= 0 && newBass != mPlayingBass) {
+                    if (mPlayingBass >= 0) {
+                        mMidiQueue.push({0x81, (uint8_t)mPlayingBass,
+                                          0, offSample});
+                    }
+                    mMidiQueue.push({0x91, (uint8_t)newBass, 80, hitSample});
+                    mPlayingBass = newBass;
+                }
+
+                // Chord pitches at hit time — channel 0 piano
+                for (int j = 0; j < mCurrentVoicing.pitchCount && j < 8; ++j) {
+                    const uint8_t p = mCurrentVoicing.pitches[j];
+                    mMidiQueue.push({0x90, p, hit.velocity, hitSample});
+                    mPlayingChordPitches.push_back(p);
+                }
+
+                // Diagnostic log so we can see (in Console.app) what
+                // beat positions hits are firing at relative to the
+                // host's reported beat/downbeat. Compare these to the
+                // beat positions of the recorded MIDI to figure out
+                // any constant offset Logic is applying
+                os_log(bebop_log(),
+                    "[sync-hit] blockStart=%.4f anchor=%.4f bar=%d offset=%.4f "
+                    "hitBeat=%.4f sampleOff=%u tempo=%.2f hostDownbeat=%.4f",
+                    blockStartBeat, currentBarStart, barIdx, offsetInBar,
+                    hitBeat, hitSample, tempo, hostDownbeat);
+            }
+        }
+    }
+
+    /// Drain `mBeatInbox`, evict any stale-gen entries from
+    /// `mPendingBeat`, then emit events whose `dueAtBeat` falls within
+    /// this audio block at sample-accurate offsets via mMidiQueue
+    void scheduleBeatEvents(double blockStartBeat, double tempo,
+                             double sampleRate, UInt32 frames) AUSDK_RTSAFE
+    {
+        // 1. Drain inbox into pending list, advancing current gen
+        bebop::BeatEvent in;
+        while (mBeatInbox.pop(in)) {
+            if (in.genId > mCurrentBeatGen) {
+                // New comp burst — drop stale events from older gens
+                mPendingBeat.erase(
+                    std::remove_if(mPendingBeat.begin(), mPendingBeat.end(),
+                        [g = in.genId](const bebop::BeatEvent& e) {
+                            return e.genId < g;
+                        }),
+                    mPendingBeat.end());
+                mCurrentBeatGen = in.genId;
+            } else if (in.genId < mCurrentBeatGen) {
+                continue; // stale, ignore
+            }
+            mPendingBeat.push_back(in);
+        }
+        if (mPendingBeat.empty()) { return; }
+        // Keep sorted by dueAtBeat — comp bursts arrive pre-sorted from
+        // Rust but multi-burst interleaving needs a stable order
+        std::sort(mPendingBeat.begin(), mPendingBeat.end(),
+            [](const bebop::BeatEvent& a, const bebop::BeatEvent& b) {
+                return a.dueAtBeat < b.dueAtBeat;
+            });
+
+        // 2. Compute block end beat. Tempo is in BPM; convert to beats/sec
+        const double beatsPerSec = tempo / 60.0;
+        const double blockSec = double(frames) / sampleRate;
+        const double blockEndBeat = blockStartBeat + blockSec * beatsPerSec;
+
+        // 3. Emit any event whose dueAtBeat falls within [blockStart,
+        //    blockEnd). Events older than blockStart fire at offset 0
+        //    (they should have fired in a prior block — likely small
+        //    drift from tempo changes; emit immediately rather than drop)
+        size_t emitCount = 0;
+        while (emitCount < mPendingBeat.size()) {
+            const bebop::BeatEvent& ev = mPendingBeat[emitCount];
+            if (ev.dueAtBeat >= blockEndBeat) { break; }
+            uint32_t sampleOffset = 0;
+            if (ev.dueAtBeat > blockStartBeat) {
+                const double offsetSec =
+                    (ev.dueAtBeat - blockStartBeat) / beatsPerSec;
+                const double offsetSamples = offsetSec * sampleRate;
+                sampleOffset = static_cast<uint32_t>(offsetSamples);
+                if (sampleOffset >= frames) {
+                    sampleOffset = frames - 1;
+                }
+            }
+            mMidiQueue.push({ev.status, ev.data1, ev.data2, sampleOffset});
+            ++emitCount;
+        }
+        if (emitCount > 0) {
+            mPendingBeat.erase(mPendingBeat.begin(),
+                mPendingBeat.begin() + emitCount);
+        }
     }
 
 private:
@@ -751,8 +1034,24 @@ private:
             while (mMidiQueue.pop(_drop)) {}
             return;
         }
-        // Stack buffer big enough for ~64 short MIDI messages. MIDIPacketList
-        // is variable-length; we pack as many events as fit.
+        // MIDIPacket.timeStamp is in mach_absolute_time units. Reference
+        // is `mach_absolute_time()` — i.e. "right now on the audio
+        // thread". Crucially, this pairs with the `beat` value the host
+        // returns from CallHostBeatAndTempo, which Logic reports as the
+        // CURRENT TRANSPORT POSITION in master beats (not the future
+        // play time of the buffer). Diagnostic logs showed that using
+        // ts.mHostTime as reference made every MIDI event land
+        // exactly PDC-beats LATER than blockStart suggested — because
+        // mHostTime is "when this audio plays" which is (transport now
+        // + PDC + output latency) while `beat` is "transport position
+        // now." Mismatched references produced a consistent ~2.4 beat
+        // off-grid shift at 94 BPM with 1.6 s PDC declared
+        static mach_timebase_info_data_t timebase = {0, 0};
+        if (timebase.denom == 0) { mach_timebase_info(&timebase); }
+        const uint64_t base_host_time = mach_absolute_time();
+        const double sampleRate = GetSampleRate();
+        const double ns_per_sample = 1e9 / sampleRate;
+
         constexpr size_t kBufBytes = 1024;
         alignas(MIDIPacketList) uint8_t storage[kBufBytes];
         auto* pktList = reinterpret_cast<MIDIPacketList*>(storage);
@@ -760,9 +1059,14 @@ private:
         bebop::MidiEvent ev;
         while (mMidiQueue.pop(ev)) {
             const Byte data[3] = { ev.status, ev.data1, ev.data2 };
+            const uint64_t offset_ns =
+                static_cast<uint64_t>(ev.sampleOffset * ns_per_sample);
+            const uint64_t offset_mach =
+                offset_ns * timebase.denom / timebase.numer;
+            const MIDITimeStamp packet_ts = base_host_time + offset_mach;
             current = MIDIPacketListAdd(
                 pktList, kBufBytes, current,
-                /*timeStamp=*/0, sizeof(data), data);
+                packet_ts, sizeof(data), data);
             if (current == nullptr) {
                 // Buffer full — leave remaining events for next render
                 // block. (Realistic worst-case is unreachable at our
@@ -774,8 +1078,12 @@ private:
             return;
         }
         if (callbackSet) {
+            // Tag with the same mach time origin as the packet
+            // timestamps so the callback host has a consistent
+            // reference for converting packet ts to sample positions
             AudioTimeStamp ts {};
-            ts.mFlags = kAudioTimeStampSampleTimeValid;
+            ts.mFlags    = kAudioTimeStampHostTimeValid;
+            ts.mHostTime = base_host_time;
             mMidiOutputCallback.midiOutputCallback(
                 mMidiOutputCallback.userData,
                 &ts,
@@ -786,7 +1094,8 @@ private:
             // MIDIReceived is documented as realtime-safe — it queues
             // packets to the kernel-resident MIDI server. Any process
             // that opened a MIDIInputPort connected to mVirtualSource
-            // receives the events asynchronously.
+            // receives the events asynchronously, scheduled at each
+            // packet's mach timestamp
             MIDIReceived(mVirtualSource, pktList);
         }
     }
@@ -959,7 +1268,23 @@ private:
                 tempoLogBlocks = blocks;
             }
 
-            // 2. feed audio for chord recognition (also triggers comp
+            // 2. push the latest host beat snapshot into the FFI so the
+            //    bar-grid alignment (RhythmSync) has fresh data the moment
+            //    comp generation fires inside bebop_process_audio. Use
+            //    mHostTempoCached (host's actual tempo) regardless of the
+            //    SyncBpm param — bar alignment must follow host time
+            //    even when the user has overridden BPM manually
+            if (mBebop != nullptr) {
+                const double hostBeat = mBeatLastValue.load(
+                    std::memory_order_relaxed);
+                const double hostBpm = mHostTempoCached.load(
+                    std::memory_order_relaxed);
+                if (hostBpm > 0.0) {
+                    bebop_set_host_beat(mBebop, hostBeat, hostBpm);
+                }
+            }
+
+            // 3. feed audio for chord recognition (also triggers comp
             //    generation when a new chord is committed)
             const size_t n = mRing.read(chunk.data(), chunk.size());
             if (n > 0) {
@@ -1042,6 +1367,54 @@ private:
                     }
                     totalEvents += got;
                     if (got < events.size()) break;
+                }
+
+                // 5. drain beat-scheduled events (legacy sync path,
+                //    bypassed by the rhythm-driven mode but still drained
+                //    so the queue doesn't grow if free-mode comp ever
+                //    routes through it)
+                BebopBeatEvent beatBuf[64];
+                while (true) {
+                    const size_t got = bebop_drain_beat_events(
+                        mBebop, beatBuf, 64);
+                    if (got == 0) break;
+                    for (size_t i = 0; i < got; ++i) {
+                        bebop::BeatEvent be;
+                        be.status    = beatBuf[i].status;
+                        be.data1     = beatBuf[i].pitch;
+                        be.data2     = beatBuf[i].velocity;
+                        be._pad      = 0;
+                        be.genId     = beatBuf[i].gen_id;
+                        be.dueAtBeat = beatBuf[i].due_at_beat;
+                        (void)mBeatInbox.push(be);
+                    }
+                    if (got < 64) break;
+                }
+
+                // 6. drain voicing updates (rhythm-driven sync path) and
+                //    forward to the audio thread. The audio thread keeps
+                //    the LATEST voicing as "current" and emits its
+                //    pitches at every rhythm hit until a new voicing
+                //    replaces it. Chord changes never disturb the rhythm
+                //    phase — they only change WHAT plays on the next hit
+                BebopVoicing voicingBuf[16];
+                while (true) {
+                    const size_t got = bebop_drain_voicing_updates(
+                        mBebop, voicingBuf, 16);
+                    if (got == 0) break;
+                    for (size_t i = 0; i < got; ++i) {
+                        bebop::Voicing v;
+                        v.genId      = voicingBuf[i].gen_id;
+                        v.bassPitch  = voicingBuf[i].bass_pitch;
+                        v.pitchCount = voicingBuf[i].pitch_count;
+                        v._pad[0]    = 0;
+                        v._pad[1]    = 0;
+                        for (int j = 0; j < 8; ++j) {
+                            v.pitches[j] = voicingBuf[i].pitches[j];
+                        }
+                        (void)mVoicingInbox.push(v);
+                    }
+                    if (got < 16) break;
                 }
             }
         }
@@ -1177,6 +1550,14 @@ private:
     // Previous block's isPlaying — used for playing→stopped edge detection
     // so we can panic-flush note_offs into the recording region in-bounds
     std::atomic<bool>     mWasPlaying        { false };
+    // Host's mHostTime for the buffer's first frame, captured by our
+    // Render override before delegating to AUEffectBase. Used as the
+    // timing reference for outgoing MIDI packets so they hit the speakers
+    // in sync with the audio — mach_absolute_time() at flushMidi time
+    // is one buffer + device-output latency EARLIER than the audio's
+    // actual play time
+    std::atomic<uint64_t> mLastHostTime      { 0 };
+    std::atomic<bool>     mLastHostTimeValid { false };
 
     // musical time location — time signature + current downbeat.
     // Used to translate between sample-time and beat-time for the
@@ -1190,6 +1571,36 @@ private:
 
     /// MIDI event queue: SPSC, worker pushes, audio thread drains.
     bebop::MidiEventQueue mMidiQueue;
+
+    /// Beat-scheduled inbox for the rhythm-sync path. Worker drains
+    /// `bebop_drain_beat_events` and pushes here; the audio thread
+    /// drains into `mPendingBeat` and emits when the host beat at
+    /// sample resolution crosses each event's `dueAtBeat`
+    bebop::BeatEventQueue mBeatInbox;
+    /// Audio-thread-only sorted list of beat-scheduled events. Walked
+    /// each block; events whose `dueAtBeat` fits inside the block fire
+    /// at sample-accurate offsets via `MidiEvent::sampleOffset`
+    std::vector<bebop::BeatEvent> mPendingBeat;
+    /// Highest comp-burst gen the audio thread has acknowledged. When a
+    /// drained event carries a higher gen, all events with lower gens
+    /// are evicted from `mPendingBeat` (a previous chord's stale events)
+    uint32_t mCurrentBeatGen { 0 };
+
+    /// Voicing inbox for the rhythm-driven sync path. Worker drains
+    /// `bebop_drain_voicing_updates` and pushes here. Audio thread reads
+    /// the LATEST voicing each block and emits its pitches at every
+    /// rhythm hit
+    bebop::VoicingQueue mVoicingInbox;
+    /// Audio-thread-only "current voicing" — what the next rhythm hit
+    /// will play. Updated by draining `mVoicingInbox`. pitchCount=0 = no
+    /// voicing yet (recognition hasn't committed a chord)
+    bebop::Voicing mCurrentVoicing { 0, -1, 0, {0,0}, {0,0,0,0,0,0,0,0} };
+    /// Pitches currently sounding on the piano channel. Tracked so the
+    /// next hit can emit clean note_offs before its note_ons
+    std::vector<uint8_t> mPlayingChordPitches;
+    /// Bass pitch currently sounding (-1 = none). Re-emitted only when
+    /// the voicing's bass changes
+    int mPlayingBass { -1 };
 
     /// Host's MIDI output callback. Set via SetProperty; called from
     /// the audio thread in flushMidi().
