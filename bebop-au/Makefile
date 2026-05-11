@@ -122,7 +122,7 @@ validate:
 	@echo "[bebop-au] arch -arm64 auval -strict -v $(AU_TYPE) $(AU_SUBTYPE) $(AU_MANUFACTURER)"
 	arch -arm64 /usr/bin/auval -strict -v $(AU_TYPE) $(AU_SUBTYPE) $(AU_MANUFACTURER)
 
-test: install test-rb test-engine test-v2midi test-params test-fixture test-vmidi
+test: install test-rb test-engine test-v2midi test-params test-fixture test-vmidi test-host-sync
 
 test-engine:
 	swiftc Tests/au_engine_test.swift \
@@ -169,6 +169,21 @@ test-vmidi:
 		-framework CoreMIDI \
 		-o $(BUILD_DIR)/au_virtual_midi_test
 	$(BUILD_DIR)/au_virtual_midi_test
+
+# Host-simulator test — registers fake HostCallbacks providing a known
+# transport rolling at fixed BPM, drives renders with synthesized audio,
+# captures MIDI output, and asserts timestamps land on the rhythm
+# template's beat offsets within tight tolerance. This is the
+# objective ground-truth test for Rhythm Sync timing — no Logic needed
+test-host-sync:
+	swiftc Tests/au_host_sync_test.swift \
+		-target arm64-apple-macos11.0 \
+		-O \
+		-framework AudioToolbox \
+		-framework CoreMIDI \
+		-framework AudioUnit \
+		-o $(BUILD_DIR)/au_host_sync_test
+	$(BUILD_DIR)/au_host_sync_test
 
 # C++ unit tests — ring buffer, etc. Doesn't need the AU installed.
 test-rb:

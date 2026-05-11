@@ -86,6 +86,42 @@ size_t bebop_panic_flush(BebopHandle* handle,
                          BebopMidiEvent* out,
                          size_t max_events);
 
+/* Beat-scheduled event for the rhythm-sync path. Must mirror
+ * `CBebopBeatEvent` in src/ffi.rs. The 8-byte gap before due_at_beat is
+ * intentional alignment padding */
+typedef struct {
+    uint8_t  status;
+    uint8_t  pitch;
+    uint8_t  velocity;
+    uint8_t  _pad;
+    uint32_t gen_id;       /* comp-burst generation; advances on each new chord */
+    double   due_at_beat;  /* host beat at which the event should fire */
+} BebopBeatEvent;
+
+/* Drain ALL pending beat-scheduled events (legacy sync path — kept for
+ * compatibility but bypassed by the rhythm-driven sync mode). */
+size_t bebop_drain_beat_events(BebopHandle* handle,
+                                BebopBeatEvent* out,
+                                size_t max_events);
+
+/* Voicing snapshot used by the rhythm-driven sync mode. The audio thread
+ * emits these pitches at each rhythm hit until a new voicing replaces
+ * the current one. Must mirror `CBebopVoicing` in src/ffi.rs (16 bytes) */
+typedef struct {
+    uint32_t gen_id;          /* monotonic; advances on each comp commit */
+    int8_t   bass_pitch;      /* -1 if no bass */
+    uint8_t  pitch_count;     /* 0..7 */
+    uint8_t  _pad[2];
+    uint8_t  pitches[8];      /* up to 7 used; pitch_count is authoritative */
+} BebopVoicing;
+
+/* Drain ALL pending voicing updates. The AU's worker calls this every
+ * iteration and forwards results into a SPSC the audio thread reads.
+ * Used only when Rhythm Sync is on */
+size_t bebop_drain_voicing_updates(BebopHandle* handle,
+                                    BebopVoicing* out,
+                                    size_t max_events);
+
 /* Parameter IDs for `bebop_set_param`. */
 enum BebopParam {
     BEBOP_PARAM_BPM           = 0,  /* float, BPM (clamped to 40..240) */
@@ -93,10 +129,18 @@ enum BebopParam {
     BEBOP_PARAM_RHYTHM        = 2,  /* int, index into all_rhythm_names() */
     BEBOP_PARAM_SPICE         = 3,  /* float 0..1, reharm intensity */
     BEBOP_PARAM_OCTAVE_SHIFT  = 4,  /* int -3..+3, octaves to shift emitted MIDI */
+    BEBOP_PARAM_RHYTHM_SYNC   = 5,  /* bool 0/1, align comp onsets to host bars */
 };
 
 /* Set a knob value. Returns 0 on success, non-zero on error. */
 int bebop_set_param(BebopHandle* handle, int param, double value);
+
+/* Push the host's current musical beat position. Used by the bar-grid
+ * alignment logic when BEBOP_PARAM_RHYTHM_SYNC is enabled — the FFI
+ * extrapolates the current beat from this snapshot at comp-generation
+ * time and delays comp onsets to land on the next bar boundary.
+ * Safe (no-op) when sync is disabled */
+int bebop_set_host_beat(BebopHandle* handle, double beat, double bpm);
 
 #ifdef __cplusplus
 } /* extern "C" */
