@@ -180,6 +180,9 @@ _ = AudioUnitSetParameter(au, /*BPM*/3,          kAudioUnitScope_Global, 0, Floa
 _ = AudioUnitSetParameter(au, /*SyncBpm*/5,      kAudioUnitScope_Global, 0, 0.0,         0)
 _ = AudioUnitSetParameter(au, /*LoopMode*/7,     kAudioUnitScope_Global, 0, 0.0,         0)
 _ = AudioUnitSetParameter(au, /*RhythmSync*/10,  kAudioUnitScope_Global, 0, 1.0,         0)
+// MIDI Latency compensation is for Logic-specific scheduling offset;
+// our simulator doesn't apply that offset so we zero it for this test
+_ = AudioUnitSetParameter(au, /*MidiLatencyMs*/13, kAudioUnitScope_Global, 0, 0.0,       0)
 
 // ─── Register HostCallbacks so the AU can call CallHostBeatAndTempo etc. ──
 

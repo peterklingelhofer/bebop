@@ -148,6 +148,8 @@ public:
         kBebopParamCompOffset = 9,  // beats: shift recorded comp earlier (negative)
         kBebopParamRhythmSync = 10, // 0=free (chord-onset), 1=sync to host bars
         kBebopParamBarOffset  = 11, // beats: manual anchor compensation for hosts whose downbeat reporting needs tuning
+        kBebopParamChordChange = 12, // sync-mode-only: 0=release, 1=let ring, 2=instant
+        kBebopParamMidiLatencyMs = 13, // ms: tempo-independent compensation for host MIDI scheduling
         kBebopParamCount,
     };
 
@@ -205,8 +207,14 @@ public:
         Globals()->SetParameter(kBebopParamLoopMode,   0.0f);  // off — PDC handles alignment
         Globals()->SetParameter(kBebopParamLoopBars,   2.0f);  // 4 bars (only used in manual mode)
         Globals()->SetParameter(kBebopParamCompOffset, 0.0f);  // PDC handles alignment
-        Globals()->SetParameter(kBebopParamRhythmSync, 0.0f);  // off — comp at chord onset
+        Globals()->SetParameter(kBebopParamRhythmSync, 1.0f);  // on by default — locks rhythm to host bars
         Globals()->SetParameter(kBebopParamBarOffset,  0.0f);  // beats: no manual offset by default
+        Globals()->SetParameter(kBebopParamChordChange, 1.0f); // let ring (default)
+        // Empirical default for Logic Pro 10.7.9: observed comp = 1049ms.
+        // Logic shifts received virtual-source MIDI by an amount smaller
+        // than our declared PDC (1.6s); user-tunable in case the actual
+        // value depends on the audio device buffer size etc.
+        Globals()->SetParameter(kBebopParamMidiLatencyMs, 1049.0f);
 
         // Boot the embedded Python interpreter via bebop-rs. This is
         // moderately expensive (~100ms cold) but happens at AU
@@ -229,7 +237,12 @@ public:
             bebop_set_param(mBebop, /*Rhythm*/ 2,   3.0);
             bebop_set_param(mBebop, /*Spice*/  3,   0.4);
             bebop_set_param(mBebop, /*Octave*/ 4,   0.0);
-            bebop_set_param(mBebop, /*RhythmSync*/ 5, 0.0);
+            // MUST match the AU param's default (1.0 = "sync to bars")
+            // — pushing 0.0 here while the UI shows "sync" puts the C++
+            // dispatch in sync mode but Rust's comp generator in free
+            // mode, so voicing never reaches the audio thread and the
+            // rhythm-hit emitter early-returns on empty voicing
+            bebop_set_param(mBebop, /*RhythmSync*/ 5, 1.0);
         }
     }
 
@@ -412,11 +425,11 @@ public:
             outParameterInfo.unit         = kAudioUnitParameterUnit_Indexed;
             outParameterInfo.minValue     = 0.0f;
             outParameterInfo.maxValue     = 1.0f;
-            // Off: comp fires at chord onset (current behavior).
-            // On: comp delayed to next host bar boundary so the rhythm
-            // pattern stays locked to the DAW grid regardless of when
-            // the chord was detected
-            outParameterInfo.defaultValue = 0.0f;
+            // Off: comp fires at chord onset (free mode).
+            // On (default): rhythm template runs locked to the host bar
+            // grid; chord changes swap the voicing per the Chord Change
+            // param's behavior
+            outParameterInfo.defaultValue = 1.0f;
             return noErr;
         case kBebopParamBarOffset:
             ausdk::AUBase::FillInParameterName(
@@ -428,6 +441,34 @@ public:
             // reported downbeat directly. Use negative values when hits
             // land late on the grid, positive when early
             outParameterInfo.defaultValue = 0.0f;
+            return noErr;
+        case kBebopParamChordChange:
+            ausdk::AUBase::FillInParameterName(
+                outParameterInfo, CFSTR("Chord Change"), false);
+            outParameterInfo.unit         = kAudioUnitParameterUnit_Indexed;
+            outParameterInfo.minValue     = 0.0f;
+            outParameterInfo.maxValue     = 2.0f;
+            // Sync-mode-only behavior on chord change:
+            //   0 release  : emit note_offs immediately; new chord plays
+            //                on the next rhythm hit (silence in between)
+            //   1 let ring : old chord rings until the next rhythm hit,
+            //                then is replaced (default)
+            //   2 instant  : emit note_offs + note_ons for the new chord
+            //                immediately; rhythm continues normally
+            outParameterInfo.defaultValue = 1.0f;
+            return noErr;
+        case kBebopParamMidiLatencyMs:
+            ausdk::AUBase::FillInParameterName(
+                outParameterInfo, CFSTR("MIDI Latency"), false);
+            outParameterInfo.unit         = kAudioUnitParameterUnit_Milliseconds;
+            outParameterInfo.minValue     = -2000.0f;
+            outParameterInfo.maxValue     =  2000.0f;
+            // Empirical compensation for the host's MIDI scheduling
+            // offset. Logic (10.7.9) records virtual-source MIDI ~1049
+            // ms earlier than our packet timestamps; we add this ms
+            // value to every packet so net offset is ~0 on the recording
+            // grid. Tune ±50 ms if your setup differs. Tempo-independent
+            outParameterInfo.defaultValue = 1049.0f;
             return noErr;
         }
         return kAudioUnitErr_InvalidParameter;
@@ -454,6 +495,7 @@ public:
             case kBebopParamLoopMode:
             case kBebopParamLoopBars:
             case kBebopParamRhythmSync:
+            case kBebopParamChordChange:
                 return noErr;
             default:
                 return kAudioUnitErr_InvalidProperty;
@@ -529,6 +571,14 @@ public:
         case kBebopParamRhythmSync: {
             CFStringRef names[] = { CFSTR("free"), CFSTR("sync to bars") };
             *outStrings = CFArrayCreate(nullptr, (const void**)names, 2,
+                                          &kCFTypeArrayCallBacks);
+            return noErr;
+        }
+        case kBebopParamChordChange: {
+            CFStringRef names[] = {
+                CFSTR("release"), CFSTR("let ring"), CFSTR("instant"),
+            };
+            *outStrings = CFArrayCreate(nullptr, (const void**)names, 3,
                                           &kCFTypeArrayCallBacks);
             return noErr;
         }
@@ -795,8 +845,24 @@ public:
         //           compatibility; not exercised by free mode)
         if (transportStatus == noErr && tempo > 0.0 && isPlaying) {
             const double sr = GetSampleRate();
-            const bool syncOn =
-                Globals()->GetParameter(kBebopParamRhythmSync) > 0.5f;
+            const float syncParam =
+                Globals()->GetParameter(kBebopParamRhythmSync);
+            const bool syncOn = syncParam > 0.5f;
+            // One-shot diagnostic so we can see in Console.app which
+            // scheduling path is being used — and what the actual param
+            // value is regardless of what the UI shows. Logs the first
+            // time the dispatch decision changes
+            const int dispatchState = syncOn ? 1 : 0;
+            const int prevDispatch = mLastDispatchState.exchange(
+                dispatchState, std::memory_order_relaxed);
+            if (prevDispatch != dispatchState) {
+                os_log(bebop_log(),
+                    "[dispatch] scheduling path %{public}s "
+                    "(RhythmSync param=%.2f)",
+                    syncOn ? "RHYTHM (phase-lock)"
+                           : "BEAT (legacy free-mode)",
+                    syncParam);
+            }
             if (syncOn) {
                 scheduleRhythmHits(beat, tempo, sr, inFramesToProcess);
             } else {
@@ -826,18 +892,43 @@ public:
                 voicingChanged = true;
             }
         }
-        // On chord change: emit immediate note_offs for any sounding
-        // pitches RIGHT NOW (sampleOffset=0 in this block) so the old
-        // harmony doesn't keep ringing into the new chord's territory.
-        // The next rhythm hit will play the new voicing fresh
+        // Chord-change behavior (sync-mode only). Three modes:
+        //   0 release  : note_offs now, wait for next rhythm hit to play new
+        //   1 let ring : nothing now; next hit's note_offs + note_ons handle it
+        //   2 instant  : note_offs + note_ons for new chord now (don't wait)
         if (voicingChanged) {
-            for (uint8_t p : mPlayingChordPitches) {
-                mMidiQueue.push({0x80, p, 0, 0});
+            const int behavior = static_cast<int>(
+                Globals()->GetParameter(kBebopParamChordChange) + 0.5f);
+            if (behavior == 0 || behavior == 2) {
+                for (uint8_t p : mPlayingChordPitches) {
+                    mMidiQueue.push({0x80, p, 0, 0});
+                }
+                mPlayingChordPitches.clear();
+                if (mPlayingBass >= 0) {
+                    mMidiQueue.push({0x81, (uint8_t)mPlayingBass, 0, 0});
+                    mPlayingBass = -1;
+                }
             }
-            mPlayingChordPitches.clear();
-            if (mPlayingBass >= 0) {
-                mMidiQueue.push({0x81, (uint8_t)mPlayingBass, 0, 0});
-                mPlayingBass = -1;
+            if (behavior == 2 && mCurrentVoicing.pitchCount > 0) {
+                // Pick a sensible velocity for the immediate trigger.
+                // Use the rhythm template's first hit (its "downbeat"
+                // feel) so the manual trigger fits the rhythm character
+                const int rhythmIdx = static_cast<int>(
+                    Globals()->GetParameter(kBebopParamRhythm) + 0.5f);
+                const auto* tmpl =
+                    bebop::lookupTemplate(static_cast<size_t>(rhythmIdx));
+                const uint8_t vel =
+                    (tmpl && tmpl->count > 0) ? tmpl->hits[0].velocity : 80;
+                const int newBass = mCurrentVoicing.bassPitch;
+                if (newBass >= 0) {
+                    mMidiQueue.push({0x91, (uint8_t)newBass, 80, 0});
+                    mPlayingBass = newBass;
+                }
+                for (int j = 0; j < mCurrentVoicing.pitchCount && j < 8; ++j) {
+                    const uint8_t p = mCurrentVoicing.pitches[j];
+                    mMidiQueue.push({0x90, p, vel, 0});
+                    mPlayingChordPitches.push_back(p);
+                }
             }
         }
         if (mCurrentVoicing.pitchCount == 0) return; // no voicing yet
@@ -1048,7 +1139,19 @@ private:
         // off-grid shift at 94 BPM with 1.6 s PDC declared
         static mach_timebase_info_data_t timebase = {0, 0};
         if (timebase.denom == 0) { mach_timebase_info(&timebase); }
-        const uint64_t base_host_time = mach_absolute_time();
+        // Empirical comp for host MIDI scheduling offset. Logic shifts
+        // received virtual-source MIDI ~1 s earlier than the packet
+        // timestamp; we add this ms value to all timestamps so the net
+        // shift is 0 on the recording grid. User-tunable
+        const float compMs =
+            Globals()->GetParameter(kBebopParamMidiLatencyMs);
+        const int64_t comp_ns = static_cast<int64_t>(compMs * 1e6);
+        const int64_t comp_mach =
+            comp_ns * static_cast<int64_t>(timebase.denom)
+                    / static_cast<int64_t>(timebase.numer);
+        const uint64_t base_host_time =
+            static_cast<uint64_t>(
+                static_cast<int64_t>(mach_absolute_time()) + comp_mach);
         const double sampleRate = GetSampleRate();
         const double ns_per_sample = 1e9 / sampleRate;
 
@@ -1558,6 +1661,9 @@ private:
     // actual play time
     std::atomic<uint64_t> mLastHostTime      { 0 };
     std::atomic<bool>     mLastHostTimeValid { false };
+    // -1 = no dispatch yet, 0 = beat-event path, 1 = rhythm-hit path.
+    // Used to emit a one-shot diagnostic when the dispatch changes
+    std::atomic<int>      mLastDispatchState { -1 };
 
     // musical time location — time signature + current downbeat.
     // Used to translate between sample-time and beat-time for the
