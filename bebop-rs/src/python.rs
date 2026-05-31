@@ -25,10 +25,30 @@ static INIT_PATH: Once = Once::new();
 /// Run once on first PyO3 call. Adds the project venv's site-packages to
 /// sys.path so `import bebop` resolves. Public so tests that hold the GIL
 /// directly (instead of going through our wrappers) can also call it.
+///
+/// Two modes:
+///   - **Dev build**: no PYTHONHOME set; libpython's compiled-in sys.path
+///     doesn't include the dev venv. We add VENV_SITE_PACKAGES via
+///     `site.addsitedir` (which also processes .pth files — `bebop` is
+///     installed editable, so its .pth pointer needs expansion).
+///   - **Standalone bundle**: the AU shell sets PYTHONHOME + PYTHONPATH
+///     pointing at the embedded `Contents/Resources/python`, so the
+///     bundled site-packages is already on sys.path. Adding the dev path
+///     on top would pollute with potentially-mismatched dependencies
+///     (different numpy/scipy versions) and crash numba's LLVM JIT.
 pub fn ensure_venv_on_path(py: Python<'_>) -> PyResult<()> {
     let mut err: Option<PyErr> = None;
     INIT_PATH.call_once(|| {
         if let Err(e) = (|| -> PyResult<()> {
+            // Standalone bundle: skip — PYTHONPATH already covers it
+            if std::env::var_os("PYTHONHOME").is_some() {
+                return Ok(());
+            }
+            // Dev build without the venv at the expected path: skip
+            // gracefully rather than erroring out
+            if !Path::new(VENV_SITE_PACKAGES).exists() {
+                return Ok(());
+            }
             // site.addsitedir does two things vs. a raw sys.path.insert:
             //   1. Adds the directory itself to sys.path (so plain packages
             //      like `bebop/` resolve)

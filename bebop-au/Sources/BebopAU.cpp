@@ -22,8 +22,10 @@
 #include <AudioUnitSDK/ComponentBase.h>
 #include <AudioToolbox/AudioUnitUtilities.h>   // AUEventListenerNotify
 #include <CoreMIDI/CoreMIDI.h>
+#include <dlfcn.h>                            // dladdr — find our own bundle path
 #include <mach/mach_time.h>
 #include <os/log.h>
+#include <sys/stat.h>
 
 #include <bebop_rs.h>
 
@@ -49,6 +51,70 @@ static os_log_t bebop_log() {
 #include "MidiEventQueue.h"
 
 #include <CoreMIDI/MIDIServices.h>
+
+namespace {
+/// Resolve the path to OUR own .component bundle by `dladdr`-ing this
+/// function's address. The returned string points at the binary inside
+/// the bundle (Contents/MacOS/BebopAU); we strip the trailing
+/// `Contents/MacOS/BebopAU` to get the bundle root. Returns empty
+/// string if dladdr fails (extremely unlikely for a loaded image)
+std::string bundle_root_path() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&bundle_root_path), &info) == 0
+        || info.dli_fname == nullptr) {
+        return {};
+    }
+    std::string p(info.dli_fname);
+    // Strip "/Contents/MacOS/BebopAU" — 3 path components up
+    for (int i = 0; i < 3; ++i) {
+        const auto pos = p.find_last_of('/');
+        if (pos == std::string::npos) return {};
+        p.resize(pos);
+    }
+    return p;
+}
+
+bool path_exists(const std::string& p) {
+    struct stat s {};
+    return stat(p.c_str(), &s) == 0;
+}
+
+/// If the bundle ships a standalone Python at Contents/Resources/python,
+/// set the env vars that make embedded CPython find it. No-op for dev
+/// builds (source tree) where that layout doesn't exist
+void setupEmbeddedPython() {
+    const std::string bundle = bundle_root_path();
+    if (bundle.empty()) {
+        os_log_error(bebop_log(),
+            "setupEmbeddedPython: dladdr failed; embedded python not set up");
+        return;
+    }
+    const std::string pyHome = bundle + "/Contents/Resources/python";
+    if (!path_exists(pyHome + "/lib/python3.12")) {
+        os_log(bebop_log(),
+            "setupEmbeddedPython: no embedded python at %{public}s — "
+            "falling back to build-time Python path",
+            pyHome.c_str());
+        return;
+    }
+    const std::string sitePkgs =
+        pyHome + "/lib/python3.12/site-packages";
+    const std::string pyPath =
+        pyHome + "/lib/python3.12:" +
+        pyHome + "/lib/python3.12/lib-dynload:" +
+        sitePkgs;
+    // 1=overwrite. Set BEFORE Py_Initialize so the interpreter picks
+    // them up. PyO3 auto-initialize defers Py_Initialize to first
+    // `Python::with_gil`, which happens inside bebop_init
+    setenv("PYTHONHOME",              pyHome.c_str(), 1);
+    setenv("PYTHONPATH",              pyPath.c_str(), 1);
+    setenv("PYTHONDONTWRITEBYTECODE", "1",            1);
+    setenv("PYTHONNOUSERSITE",        "1",            1);
+    setenv("PYTHONUNBUFFERED",        "1",            1);
+    os_log(bebop_log(),
+        "setupEmbeddedPython: PYTHONHOME=%{public}s", pyHome.c_str());
+}
+} // namespace
 
 /// Per-channel kernel. AUEffectBase's render path is per-channel: for each
 /// channel of input it instantiates one of these and calls Process() with
@@ -215,6 +281,15 @@ public:
         // than our declared PDC (1.6s); user-tunable in case the actual
         // value depends on the audio device buffer size etc.
         Globals()->SetParameter(kBebopParamMidiLatencyMs, 1049.0f);
+
+        // STANDALONE-BUNDLE PYTHON SETUP. When the .component bundle
+        // ships its own Python under Contents/Resources/python, we
+        // resolve the bundle path at runtime and point PYTHONHOME at
+        // it BEFORE bebop_init triggers Py_Initialize. The dev/source
+        // build doesn't have the embedded layout — we detect by
+        // probing the path and only set the env vars when the
+        // standalone layout is present
+        setupEmbeddedPython();
 
         // Boot the embedded Python interpreter via bebop-rs. This is
         // moderately expensive (~100ms cold) but happens at AU
