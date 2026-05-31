@@ -27,3 +27,4 @@ bebop-au/build/
 
 # Vendored AudioUnitSDK is a git submodule-style dependency — committed via
 # git but build outputs from xcodebuild are gitignored above
+.env
