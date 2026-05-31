@@ -185,6 +185,68 @@ test-host-sync:
 		-o $(BUILD_DIR)/au_host_sync_test
 	$(BUILD_DIR)/au_host_sync_test
 
+# Standalone redistributable bundle. Copies libpython, the Python stdlib,
+# and the entire .venv site-packages into the .component so end-users
+# don't need to install Python or any deps. Rewrites the dylib rpath to
+# @loader_path/../Frameworks so libpython resolves from inside the
+# bundle. The C++ AU sets PYTHONHOME at startup from the bundle path.
+# Output: build/bebop-standalone.component (separate from the dev bundle
+# so the dev bundle stays small)
+PYTHON_STDLIB := $(PY_PREFIX)/lib/$(PY_LIB_NAME)
+VENV_SITE_PACKAGES := $(realpath $(BEBOP_RS_DIR)/..)/.venv/lib/$(PY_LIB_NAME)/site-packages
+BEBOP_PKG := $(realpath $(BEBOP_RS_DIR)/..)/bebop
+STANDALONE_BUNDLE := $(BUILD_DIR)/bebop-standalone.component
+STANDALONE_ZIP    := $(BUILD_DIR)/bebop-standalone.component.zip
+
+.PHONY: bundle-standalone
+bundle-standalone: build
+	@echo "[standalone] removing stale bundle"
+	rm -rf $(STANDALONE_BUNDLE) $(STANDALONE_ZIP)
+	@echo "[standalone] copying dev bundle as base"
+	cp -R $(BUNDLE_DIR) $(STANDALONE_BUNDLE)
+	@echo "[standalone] embedding libpython into Contents/Frameworks/"
+	mkdir -p $(STANDALONE_BUNDLE)/Contents/Frameworks
+	cp $(PY_LIB_DIR)/lib$(PY_LIB_NAME).dylib \
+		$(STANDALONE_BUNDLE)/Contents/Frameworks/
+	chmod u+w $(STANDALONE_BUNDLE)/Contents/Frameworks/lib$(PY_LIB_NAME).dylib
+	@echo "[standalone] rewriting rpath + dylib references"
+	install_name_tool -change \
+		$(PY_LIB_DIR)/lib$(PY_LIB_NAME).dylib \
+		@rpath/lib$(PY_LIB_NAME).dylib \
+		$(STANDALONE_BUNDLE)/Contents/MacOS/$(PLUGIN_NAME)
+	install_name_tool -delete_rpath $(PY_LIB_DIR) \
+		$(STANDALONE_BUNDLE)/Contents/MacOS/$(PLUGIN_NAME)
+	install_name_tool -add_rpath @loader_path/../Frameworks \
+		$(STANDALONE_BUNDLE)/Contents/MacOS/$(PLUGIN_NAME)
+	install_name_tool -id @rpath/lib$(PY_LIB_NAME).dylib \
+		$(STANDALONE_BUNDLE)/Contents/Frameworks/lib$(PY_LIB_NAME).dylib
+	@echo "[standalone] copying Python stdlib (~30MB)"
+	mkdir -p $(STANDALONE_BUNDLE)/Contents/Resources/python/lib
+	cp -R $(PYTHON_STDLIB) \
+		$(STANDALONE_BUNDLE)/Contents/Resources/python/lib/
+	@echo "[standalone] copying venv site-packages (~470MB)"
+	cp -R $(VENV_SITE_PACKAGES) \
+		$(STANDALONE_BUNDLE)/Contents/Resources/python/lib/$(PY_LIB_NAME)/
+	@echo "[standalone] copying bebop package into site-packages"
+	rm -rf $(STANDALONE_BUNDLE)/Contents/Resources/python/lib/$(PY_LIB_NAME)/site-packages/bebop
+	cp -R $(BEBOP_PKG) \
+		$(STANDALONE_BUNDLE)/Contents/Resources/python/lib/$(PY_LIB_NAME)/site-packages/
+	@echo "[standalone] stripping __pycache__ + .pyc"
+	find $(STANDALONE_BUNDLE)/Contents/Resources/python -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find $(STANDALONE_BUNDLE)/Contents/Resources/python -type f -name '*.pyc' -delete 2>/dev/null || true
+	@echo "[standalone] re-signing bundle (ad-hoc, no notarization)"
+	codesign --force --sign - --timestamp=none --deep $(STANDALONE_BUNDLE)
+	@du -sh $(STANDALONE_BUNDLE)
+	@echo "[standalone] OK -> $(STANDALONE_BUNDLE)"
+
+.PHONY: standalone-zip
+standalone-zip: bundle-standalone
+	@echo "[standalone] zipping via ditto (preserves macOS metadata)"
+	cd $(BUILD_DIR) && ditto -c -k --sequesterRsrc --keepParent \
+		bebop-standalone.component bebop-standalone.component.zip
+	@ls -la $(STANDALONE_ZIP)
+	@shasum -a 256 $(STANDALONE_ZIP)
+
 # C++ unit tests — ring buffer, etc. Doesn't need the AU installed.
 test-rb:
 	clang++ -std=c++23 -target arm64-apple-macos11.0 -O2 -stdlib=libc++ \
