@@ -11,12 +11,12 @@ output/
 *.mid
 *.midi
 
-# vendor build artifacts (re-build with vendor/build_nnls_chroma.sh)
-vendor/vamp-plugin-sdk/build/
-vendor/nnls-chroma/build/
-vendor/nnls-chroma/*.o
-vendor/nnls-chroma/*.dylib
-vendor/nnls-chroma/*.bak
+# Third-party plugin sources are cloned/built locally by
+# vendor/build_nnls_chroma.sh and must NEVER be committed. Ignore the entire
+# clone targets so a stray `git add` can't redistribute the BSD (Vamp SDK) or
+# GPL (NNLS-Chroma) source trees. Only build_nnls_chroma.sh is tracked here.
+vendor/vamp-plugin-sdk/
+vendor/nnls-chroma/
 
 # Rust build artifacts (Cargo.lock is committed — bebop_cli is a binary
 # crate, so pinning deps for reproducibility is the right call)
