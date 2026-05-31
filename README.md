@@ -1,10 +1,20 @@
 # bebop
 
-Add advanced jazz comping to existing songs. Takes a chord chart and/or audio in,
-gets six different chord-recognition opinions, votes a consensus, applies tiered
-jazz reharmonization (7ths → ii-V's → tritone subs → Coltrane changes), voices
-the result in your choice of jazz piano styles, and writes MIDI plus rendered
-audio plus a single-page HTML report you can open and audit in a browser.
+A jazz reharmonization engine. Takes a chord chart or audio, runs ensemble
+chord recognition (six sources, consensus vote), applies tiered jazz
+reharmonization (7ths → ii-V's → tritone subs → Coltrane changes), and renders
+voiced MIDI, audio, and an auditable HTML report.
+
+The reharmonization is not AI: every chord substitution and voicing comes from
+deterministic music theory, and each decision is logged with the reason it was
+made, so you can audit and adjust it. Machine learning is used in exactly one
+place, the chord-recognition step, and only for audio input: of the optional
+audio sources, basic-pitch (Spotify's audio-to-MIDI model) and autochord (a
+transformer-based recognizer) are ML; the chart, MIDI, and librosa chromagram
+paths are not. Hand it a chord chart and no ML runs at all.
+
+Built as a Python engine, with a Rust core (via PyO3) for performance-critical
+paths and a native Swift Audio Unit plugin for real-time use in Logic.
 
 ## Quick start
 
@@ -409,3 +419,16 @@ keyed by the audio file's content hash and the BPM. First run takes 30–60s;
 subsequent runs against the same file return instantly.
 
 To invalidate: `rm -rf .bebop_cache/`.
+
+## License
+
+bebop is released under the [MIT License](LICENSE).
+
+It optionally uses third-party chord-recognition tools that are installed
+separately and keep their own licenses: the Vamp Plugin SDK (BSD-style) and
+NNLS-Chroma (GPL), both cloned and built locally by
+`vendor/build_nnls_chroma.sh` (never bundled in this repo), and the
+pip-installed `basic-pitch` and `autochord` models. NNLS-Chroma is invoked at
+runtime as a separate Vamp plugin rather than linked, so bebop's own MIT code
+is unaffected. Skip those optional sources (use `--chart` / `--midi`) and none
+of them are involved.
