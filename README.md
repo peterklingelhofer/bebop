@@ -1,9 +1,6 @@
 # bebop
 
-A jazz reharmonization engine. Takes a chord chart or audio, runs ensemble
-chord recognition (six sources, consensus vote), applies tiered jazz
-reharmonization (7ths → ii-V's → tritone subs → Coltrane changes), and renders
-voiced MIDI, audio, and an auditable HTML report.
+Pitch and chord analysis with jazz-theory-backed suggestions for increasing harmonic complexity. Takes a chord chart or audio, runs ensemble chord recognition (six sources, consensus vote), applies tiered reharmonization (7ths → ii-V's → tritone subs → Coltrane changes), and writes voiced MIDI, audio and an auditable HTML report of every decision and why it was made.
 
 The reharmonization is not AI: every chord substitution and voicing comes from
 deterministic music theory, and each decision is logged with the reason it was
