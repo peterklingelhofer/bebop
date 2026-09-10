@@ -34,6 +34,7 @@ class ReharmContext:
     rng: random.Random
     key_pc: int | None = None       # active tonic pitch class
     key_is_major: bool = True       # active mode
+    prefer_flats: bool = False      # active key's preferred spelling for inserted roots
 
 
 # ---------- chord symbol parsing helpers ----------
@@ -59,17 +60,45 @@ def parse_root(symbol: str) -> tuple[int, str]:
     return root_pc, rest
 
 
+def root_name(symbol: str) -> str:
+    """Return the chord symbol's own root spelling (letter + accidental).
+
+    E.g. "Bb" from "Bbmaj7", "F#" from "F#m7b5": the literal text, not a
+    pitch-class respelling, so a chart's own flat/sharp choice survives subs
+    that don't change the root.
+    """
+    if not symbol:
+        return "C"
+    head = symbol[0].upper()
+    rest = symbol[1:]
+    accidental = rest[0] if rest and rest[0] in ("#", "b") else ""
+    return head + accidental
+
+
 def pc_to_name(pc: int, prefer_flats: bool = False) -> str:
     return (FLAT_NAMES if prefer_flats else SHARP_NAMES)[pc % 12]
+
+
+FLAT_KEYS_MAJOR = {"F", "Bb", "Eb", "Ab", "Db", "Gb", "Cb"}
+FLAT_KEYS_MINOR = {"D", "G", "C", "F", "Bb", "Eb", "Ab"}
+
+
+def prefer_flats_for_key(key: str | None) -> bool:
+    """True when `key` is a flat-side major/minor key. Trailing "m" is the only minor marker."""
+    if not key:
+        return False
+    is_minor = key.endswith("m")
+    tonic = key[:-1] if is_minor else key
+    return tonic in (FLAT_KEYS_MINOR if is_minor else FLAT_KEYS_MAJOR)
 
 
 def is_dominant(symbol: str) -> bool:
     """True if the chord is functioning as a dominant (V-style)."""
     _, rest = parse_root(symbol)
-    if not rest:
+    if not rest or rest.startswith("maj") or rest.startswith("m"):
         return False
-    # Anything starting with a bare digit (7, 9, 13) is dominant unless prefixed by 'maj'/'m'.
-    return rest[0] in ("7", "9") and not rest.startswith("maj") and not rest.startswith("m")
+    # A bare extension (7, 9, 11, 13) with no maj/m prefix is dominant
+    return rest.startswith(("7", "9", "11", "13"))
 
 
 def quality_of(symbol: str) -> str:
@@ -83,7 +112,7 @@ def quality_of(symbol: str) -> str:
         return "min"
     if rest.startswith("sus"):
         return "sus"
-    if rest and rest[0] in ("7", "9"):
+    if rest.startswith(("7", "9", "11", "13")):
         return "dom"
     if not rest or rest[0] in ("6",):
         return "maj"
@@ -96,13 +125,13 @@ def add_sevenths(c: Chord, ctx: ReharmContext) -> Chord:
     """Major triad -> maj7, minor triad -> m7, dominant triad with no extension -> 7."""
     if ctx.rng.random() > _tier_strength(ctx.spice, 0.0, 0.4):
         return c
-    root_pc, rest = parse_root(c.symbol)
+    _, rest = parse_root(c.symbol)
     if rest == "":
-        return c.with_symbol(f"{pc_to_name(root_pc)}maj7")
+        return c.with_symbol(f"{root_name(c.symbol)}maj7")
     if rest == "m":
-        return c.with_symbol(f"{pc_to_name(root_pc)}m7")
+        return c.with_symbol(f"{root_name(c.symbol)}m7")
     if rest in ("sus4", "sus2"):
-        return c.with_symbol(f"{pc_to_name(root_pc)}{rest[:3]}7" if rest.startswith("sus") else c.symbol)
+        return c.with_symbol(f"{root_name(c.symbol)}{rest[:3]}7" if rest.startswith("sus") else c.symbol)
     return c
 
 
@@ -111,7 +140,7 @@ def add_extensions(c: Chord, ctx: ReharmContext) -> Chord:
     p = _tier_strength(ctx.spice, 0.05, 0.5)
     if ctx.rng.random() > p:
         return c
-    root_pc, rest = parse_root(c.symbol)
+    _, rest = parse_root(c.symbol)
     promotions = {
         "maj7": ["maj9", "maj13"],
         "m7":   ["m9", "m11"],
@@ -119,7 +148,7 @@ def add_extensions(c: Chord, ctx: ReharmContext) -> Chord:
     }
     for src, choices in promotions.items():
         if rest == src:
-            return c.with_symbol(f"{pc_to_name(root_pc)}{ctx.rng.choice(choices)}")
+            return c.with_symbol(f"{root_name(c.symbol)}{ctx.rng.choice(choices)}")
     return c
 
 
@@ -138,7 +167,8 @@ def insert_secondary_dominant(c: Chord, ctx: ReharmContext) -> list[Chord] | Cho
     root_pc, _ = parse_root(c.symbol)
     v_pc = (root_pc + 7) % 12
     half = c.duration_beats / 2
-    v_chord = Chord(symbol=f"{pc_to_name(v_pc)}7", start_beat=c.start_beat, duration_beats=half)
+    v_chord = Chord(symbol=f"{pc_to_name(v_pc, prefer_flats=ctx.prefer_flats)}7",
+                    start_beat=c.start_beat, duration_beats=half)
     return [v_chord, Chord(symbol=c.symbol, start_beat=c.start_beat + half, duration_beats=half, bass=c.bass)]
 
 
@@ -154,8 +184,10 @@ def insert_two_five(c: Chord, ctx: ReharmContext) -> list[Chord] | Chord:
     v_pc = (root_pc + 7) % 12
     quarter = c.duration_beats / 4
     return [
-        Chord(symbol=f"{pc_to_name(ii_pc)}m7", start_beat=c.start_beat, duration_beats=quarter),
-        Chord(symbol=f"{pc_to_name(v_pc)}7", start_beat=c.start_beat + quarter, duration_beats=quarter),
+        Chord(symbol=f"{pc_to_name(ii_pc, prefer_flats=ctx.prefer_flats)}m7",
+              start_beat=c.start_beat, duration_beats=quarter),
+        Chord(symbol=f"{pc_to_name(v_pc, prefer_flats=ctx.prefer_flats)}7",
+              start_beat=c.start_beat + quarter, duration_beats=quarter),
         Chord(symbol=c.symbol, start_beat=c.start_beat + 2 * quarter, duration_beats=2 * quarter, bass=c.bass),
     ]
 
@@ -181,12 +213,12 @@ def alter_dominant(c: Chord, ctx: ReharmContext) -> Chord:
     p = _tier_strength(ctx.spice, 0.4, 0.7)
     if ctx.rng.random() > p:
         return c
-    root_pc, rest = parse_root(c.symbol)
+    _, rest = parse_root(c.symbol)
     # don't double-alter
     if any(alt in rest for alt in ("b9", "#9", "#11", "b13", "alt")):
         return c
     alteration = ctx.rng.choice(["b9", "#9", "#11", "b13", "alt"])
-    return c.with_symbol(f"{pc_to_name(root_pc)}7{alteration}")
+    return c.with_symbol(f"{root_name(c.symbol)}7{alteration}")
 
 
 # ---------- TIER 4 (0.6–0.8): diminished passing chords & modal interchange ----------
@@ -198,12 +230,13 @@ def diminished_passing(c: Chord, ctx: ReharmContext) -> list[Chord] | Chord:
     p = _tier_strength(ctx.spice, 0.55, 0.6)
     if ctx.rng.random() > p:
         return c
-    root_pc, rest = parse_root(c.symbol)
+    root_pc, _ = parse_root(c.symbol)
     pass_pc = (root_pc + 1) % 12
     half = c.duration_beats / 2
     return [
         Chord(symbol=c.symbol, start_beat=c.start_beat, duration_beats=half, bass=c.bass),
-        Chord(symbol=f"{pc_to_name(pass_pc)}dim7", start_beat=c.start_beat + half, duration_beats=half),
+        Chord(symbol=f"{pc_to_name(pass_pc, prefer_flats=ctx.prefer_flats)}dim7",
+              start_beat=c.start_beat + half, duration_beats=half),
     ]
 
 
@@ -223,14 +256,14 @@ def modal_interchange(c: Chord, ctx: ReharmContext) -> Chord:
         interval = (root_pc - ctx.key_pc) % 12
         # IV (interval 5, major) -> iv (minor)
         if interval == 5 and q == "maj":
-            return c.with_symbol(f"{pc_to_name(root_pc)}m7")
+            return c.with_symbol(f"{root_name(c.symbol)}m7")
         # II (interval 2, minor) -> II7 (Lydian dominant tinge) — sparingly
         if interval == 2 and q == "min" and ctx.rng.random() < 0.4:
-            return c.with_symbol(f"{pc_to_name(root_pc)}7")
+            return c.with_symbol(f"{root_name(c.symbol)}7")
         return c
     # no key context: only soft, occasional major->minor
     if q == "maj" and ctx.rng.random() < 0.3:
-        return c.with_symbol(f"{pc_to_name(root_pc)}m7")
+        return c.with_symbol(f"{root_name(c.symbol)}m7")
     return c
 
 
@@ -269,13 +302,19 @@ def coltrane_changes(c: Chord, ctx: ReharmContext) -> list[Chord] | Chord:
     v_of_third = (third_up + 7) % 12     # V7 leading to the M3-up tonic
     v_of_sixth = (sixth_up + 7) % 12
     sl = c.duration_beats / 6  # 6 chord changes evenly
+    pf = ctx.prefer_flats
     return [
-        Chord(symbol=f"{pc_to_name(root_pc)}{quality_suffix}", start_beat=c.start_beat + 0 * sl, duration_beats=sl),
-        Chord(symbol=f"{pc_to_name(v_of_sixth)}7",            start_beat=c.start_beat + 1 * sl, duration_beats=sl),
-        Chord(symbol=f"{pc_to_name(sixth_up)}{quality_suffix}", start_beat=c.start_beat + 2 * sl, duration_beats=sl),
-        Chord(symbol=f"{pc_to_name(v_of_third)}7",            start_beat=c.start_beat + 3 * sl, duration_beats=sl),
-        Chord(symbol=f"{pc_to_name(third_up)}{quality_suffix}", start_beat=c.start_beat + 4 * sl, duration_beats=sl),
-        Chord(symbol=f"{pc_to_name((root_pc + 7) % 12)}7",    start_beat=c.start_beat + 5 * sl, duration_beats=sl),
+        Chord(symbol=f"{root_name(c.symbol)}{quality_suffix}", start_beat=c.start_beat + 0 * sl, duration_beats=sl),
+        Chord(symbol=f"{pc_to_name(v_of_sixth, prefer_flats=pf)}7",
+              start_beat=c.start_beat + 1 * sl, duration_beats=sl),
+        Chord(symbol=f"{pc_to_name(sixth_up, prefer_flats=pf)}{quality_suffix}",
+              start_beat=c.start_beat + 2 * sl, duration_beats=sl),
+        Chord(symbol=f"{pc_to_name(v_of_third, prefer_flats=pf)}7",
+              start_beat=c.start_beat + 3 * sl, duration_beats=sl),
+        Chord(symbol=f"{pc_to_name(third_up, prefer_flats=pf)}{quality_suffix}",
+              start_beat=c.start_beat + 4 * sl, duration_beats=sl),
+        Chord(symbol=f"{pc_to_name((root_pc + 7) % 12, prefer_flats=pf)}7",
+              start_beat=c.start_beat + 5 * sl, duration_beats=sl),
     ]
 
 

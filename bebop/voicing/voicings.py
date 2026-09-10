@@ -20,6 +20,7 @@ from functools import lru_cache
 
 from music21 import harmony, pitch
 
+from bebop.reharm.substitutions import root_name
 from bebop.types import Chord
 
 
@@ -39,6 +40,16 @@ _HALF_SPAN = 10                      # voicings within ±10 semitones of center
 
 # ─────────────────────────── chord-symbol parsing ────────────────────────────
 
+def _normalize_suffix(rest: str) -> str:
+    """Translate our internal jazz suffix vocabulary into music21's accepted abbreviations."""
+    if rest.endswith("7alt"):
+        rest = rest[:-4] + "7b9b13"
+    for src, dst in (("maj13", "M13"), ("maj9", "M9")):
+        if src in rest:
+            rest = rest.replace(src, dst)
+    return rest
+
+
 def _normalize_for_music21(symbol: str) -> str:
     """Translate our internal jazz vocabulary into music21's accepted abbreviations.
 
@@ -47,18 +58,11 @@ def _normalize_for_music21(symbol: str) -> str:
     Easiest fix: enharmonically respell flats to sharps for music21 only — we keep
     the readable flat names internally for chord chart output.
     """
-    if symbol.endswith("7alt"):
-        symbol = symbol[:-4] + "7b9b13"
-    for src, dst in (("maj13", "M13"), ("maj9", "M9")):
-        if src in symbol:
-            symbol = symbol.replace(src, dst)
+    root = root_name(symbol)
+    rest = _normalize_suffix(symbol[len(root):])
     # respell bare flat roots to sharp enharmonics: Ab -> G#, Bb -> A#, Db -> C#, Eb -> D#, Gb -> F#
     enharmonic = {"Ab": "G#", "Bb": "A#", "Db": "C#", "Eb": "D#", "Gb": "F#"}
-    for flat, sharp in enharmonic.items():
-        if symbol.startswith(flat):
-            symbol = sharp + symbol[len(flat):]
-            break
-    return symbol
+    return enharmonic.get(root, root) + rest
 
 
 _RESOLVE_FAILURES_LOGGED: set[str] = set()

@@ -1,0 +1,7 @@
+# a plain eight bars in F for trying bebop; nothing here is a song
+bpm: 120
+time: 4/4
+key: F
+
+| F      | Dm     | Gm     | C7     |
+| F      | Bb     | Gm  C7 | F      |

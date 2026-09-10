@@ -13,10 +13,15 @@ Renderer-side concerns (HTML, CSS, JS) live in `report.py`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
-from bebop.reharm.substitutions import parse_root, pc_to_name, quality_of
+from music21 import harmony
+
+from bebop.io.midi_in import _PITCH_NAMES_FLAT, _PITCH_NAMES_SHARP
+from bebop.reharm.substitutions import parse_root, pc_to_name, prefer_flats_for_key, quality_of, root_name
 from bebop.types import ChordSequence
 from bebop.voicing import voice_chord
+from bebop.voicing.voicings import _normalize_suffix, _resolve_pitches
 
 
 # ──────────────────────────── theory annotation ─────────────────────────────
@@ -54,7 +59,8 @@ def _has_extensions_above(symbol: str, threshold_steps: int) -> bool:
 
 
 def explain_substitution(original_symbols: list[str], new_symbol: str,
-                         next_original: str | None = None) -> str:
+                         next_original: str | None = None,
+                         prefer_flats: bool = False) -> str:
     """Heuristic short description of how `new_symbol` differs from the originals
     that would have been sounding at the same beat.
 
@@ -82,12 +88,12 @@ def explain_substitution(original_symbols: list[str], new_symbol: str,
             return _describe_extension_change(primary_original, new_symbol)
         # quality changed: modal interchange or parallel transformation
         if o_quality == "maj" and n_quality == "min":
-            return "modal interchange — major → minor (parallel)"
+            return "modal interchange: major to minor (parallel)"
         if o_quality == "min" and n_quality == "maj":
-            return "parallel — minor → major"
+            return "parallel: minor to major"
         if o_quality in ("maj", "min") and n_quality == "dom":
             return f"turned into a dominant 7"
-        return f"changed quality: {_QUALITY_NAME.get(o_quality, '')} → {_QUALITY_NAME.get(n_quality, '')}"
+        return f"changed quality: {_QUALITY_NAME.get(o_quality, '')} to {_QUALITY_NAME.get(n_quality, '')}"
 
     # ── different root ──
     # Insert into next-chord context if we have it
@@ -96,26 +102,29 @@ def explain_substitution(original_symbols: list[str], new_symbol: str,
         # Inserted V7 of the next chord (secondary dominant)
         if n_quality == "dom" and _interval(n_root, next_root) == 5:
             # n_root is a 5th below next root, i.e., n_root is V of next
-            return f"V7 of {pc_to_name(next_root)} (secondary dominant)"
+            return f"V7 of {pc_to_name(next_root, prefer_flats=prefer_flats)} (secondary dominant)"
         # Inserted ii of the next chord
         if n_quality == "min" and _interval(n_root, next_root) == 10:
-            return f"ii of {pc_to_name(next_root)} (inserted in ii-V)"
-        # Tritone sub of the V7 of next chord
-        if n_quality == "dom" and _interval(n_root, next_root) == 1:
-            return f"tritone sub: {pc_to_name((next_root - 5) % 12)}7 → {new_symbol} (resolves down a half-step to {pc_to_name(next_root)})"
+            return f"ii of {pc_to_name(next_root, prefer_flats=prefer_flats)} (inserted in ii-V)"
+        # Tritone sub of the V7 of next chord: n_root resolves DOWN a half-step
+        # to next_root, i.e. next_root is a half-step BELOW n_root
+        if n_quality == "dom" and _interval(n_root, next_root) == 11:
+            v_root = pc_to_name((next_root - 5) % 12, prefer_flats=prefer_flats)
+            return (f"tritone sub for {v_root}7 (resolves down a half-step to "
+                    f"{pc_to_name(next_root, prefer_flats=prefer_flats)})")
 
     # Distance from original by interval
     interval = _interval(o_root, n_root)
     if interval == 6:
         return f"tritone sub of {primary_original}"
     if interval == 7:
-        return f"V7 — root up a 5th from {primary_original}"
+        return f"V7: root up a 5th from {primary_original}"
     if interval == 5:
         return f"root up a 4th from {primary_original}"
     if interval == 1:
-        return f"chromatic neighbor — half-step above {primary_original}"
+        return f"chromatic neighbor: a half-step above {primary_original}"
     if interval == 11:
-        return f"chromatic neighbor — half-step below {primary_original}"
+        return f"chromatic neighbor: a half-step below {primary_original}"
     if interval == 4:
         return f"root up a major 3rd (Coltrane-style)"
     if interval == 8:
@@ -138,25 +147,68 @@ def _describe_extension_change(original: str, new: str) -> str:
         return ""
     if not o_rest and "7" in n_rest and "maj" not in n_rest:
         return "added dominant 7th"
-    # detect added extensions
+    # detect added extensions: consume each match out of `remaining` so a
+    # longer token (e.g. "maj9") doesn't also register as a shorter one found
+    # inside it ("9"); check longer/more specific tokens first, bare "7" last
     extensions_added: list[str] = []
-    for token in ("maj9", "maj13", "9", "11", "13", "6", "b9", "#9", "#11", "b13", "alt"):
-        if token in n_rest and token not in o_rest:
+    remaining = n_rest
+    for token in ("maj9", "maj13", "b9", "#9", "#11", "b13", "9", "11", "13", "6", "alt", "7"):
+        if token in remaining and token not in o_rest:
             extensions_added.append(token)
+            remaining = remaining.replace(token, "", 1)
     if extensions_added:
         return "added " + " + ".join(extensions_added)
-    return f"upgraded {original} → {new}"
+    return f"upgraded {original} to {new}"
 
 
 # ──────────────────────────── voicing breakdown ─────────────────────────────
+
+
+@lru_cache(maxsize=1024)
+def _chord_spelling(symbol: str) -> dict[int, str]:
+    """Map pitch class -> the note name music21 gives it within this chord.
+
+    A7's third is C# even in a flat key: the chord symbol decides how its own
+    tones are spelled. Tones music21 spells with a double accidental (Gbdim7's
+    third comes out B--) are skipped and fall back to the key's spelling.
+    """
+    root = root_name(symbol)
+    norm = root.replace("b", "-") + _normalize_suffix(symbol[len(root):])
+    try:
+        cs = harmony.ChordSymbol(norm)
+    except Exception:
+        return {}
+    spelling: dict[int, str] = {}
+    for p in cs.pitches:
+        name = p.name.replace("-", "b")
+        if "bb" in name or "##" in name:
+            continue
+        spelling[p.pitchClass] = name
+    return spelling
+
+
+def spell_pitch(midi: int, symbol: str, prefer_flats: bool) -> str:
+    """Name `midi` (with octave) as `symbol` spells that pitch class, falling
+    back to the key's spelling for tones outside the chord (a slash bass, an
+    added tension).
+    """
+    pc = midi % 12
+    name = _chord_spelling(symbol).get(pc)
+    if name is None:
+        name = (_PITCH_NAMES_FLAT if prefer_flats else _PITCH_NAMES_SHARP)[pc]
+    natural = midi - (1 if "#" in name else -1 if "b" in name[1:] else 0)
+    octave = natural // 12 - 1
+    return f"{name}{octave}"
 
 
 @dataclass(frozen=True, slots=True)
 class VoicingBreakdown:
     chord_symbol: str
     bass_pitch: int
+    bass_name: str                # spelled from the chord, e.g. "Bb2"
     bass_interval: str           # interval label for the bass note from chord root
     chord_pitches: tuple[int, ...]
+    pitch_names: tuple[str, ...]  # spelled from the chord, parallel to chord_pitches
     intervals: tuple[str, ...]   # interval label per chord_pitch, in order
     summary: str                 # e.g. "rootless 3-7-9 shell"
 
@@ -197,13 +249,16 @@ def voicing_breakdown(reharmed: ChordSequence, voicing_style: str) -> list[Voici
             root_pc, _ = parse_root(chord.symbol)
         except Exception:
             root_pc = 0
+        prefer_flats = prefer_flats_for_key(reharmed.key_at(chord.start_beat))
         intervals = tuple(_interval_label((p - root_pc) % 12) for p in v.chord_pitches)
         bass_interval = _interval_label((v.bass_pitch - root_pc) % 12)
         out.append(VoicingBreakdown(
             chord_symbol=chord.symbol,
             bass_pitch=v.bass_pitch,
+            bass_name=spell_pitch(v.bass_pitch, chord.symbol, prefer_flats),
             bass_interval=bass_interval,
             chord_pitches=v.chord_pitches,
+            pitch_names=tuple(spell_pitch(p, chord.symbol, prefer_flats) for p in v.chord_pitches),
             intervals=intervals,
             summary=_voicing_summary(intervals, voicing_style),
         ))
@@ -219,18 +274,23 @@ class ChartRow:
     beat: float                 # absolute beat position in song
     duration_beats: float
     original_symbol: str | None
+    original_pcs: tuple[int, ...]   # sorted pitch classes of original_symbol; () if none
     new_symbol: str
     new_bass: str | None
     theory_note: str
 
 
 def _originals_at_beat(original: ChordSequence, beat: float) -> list[str]:
-    """Return original-chart symbol(s) sounding at `beat` (just before, inclusive)."""
-    out = []
-    for c in original.chords:
-        if c.start_beat <= beat < c.end_beat + 1e-6:
-            out.append(c.symbol)
-    return out
+    """Return the original-chart symbol(s) sounding at `beat`.
+
+    Chord intervals are [start, end): a beat on a bar boundary belongs to the
+    chord that starts there. The epsilon only forgives float drift, so when the
+    outgoing and incoming chord both match, keep the later one.
+    """
+    matches = [c for c in original.chords if c.start_beat <= beat < c.end_beat + 1e-6]
+    if len(matches) > 1:
+        matches = [max(matches, key=lambda c: c.start_beat)]
+    return [c.symbol for c in matches]
 
 
 def chart_comparison(original: ChordSequence, reharmed: ChordSequence,
@@ -247,12 +307,17 @@ def chart_comparison(original: ChordSequence, reharmed: ChordSequence,
             next_originals = _originals_at_beat(original, next_chord.start_beat)
             if next_originals:
                 next_orig = next_originals[0]
-        note = explain_substitution(originals, chord.symbol, next_orig)
+        prefer_flats = prefer_flats_for_key(reharmed.key_at(chord.start_beat))
+        note = explain_substitution(originals, chord.symbol, next_orig, prefer_flats=prefer_flats)
+        original_symbol = originals[0] if originals else None
+        original_pcs = (tuple(sorted({p % 12 for p in _resolve_pitches(original_symbol)}))
+                        if original_symbol else ())
         rows.append(ChartRow(
             bar=bar,
             beat=chord.start_beat,
             duration_beats=chord.duration_beats,
-            original_symbol=originals[0] if originals else None,
+            original_symbol=original_symbol,
+            original_pcs=original_pcs,
             new_symbol=chord.symbol,
             new_bass=chord.bass,
             theory_note=note,

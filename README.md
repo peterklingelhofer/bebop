@@ -13,6 +13,23 @@ paths are not. Hand it a chord chart and no ML runs at all.
 Built as a Python engine, with a Rust core (via PyO3) for performance-critical
 paths and a native Swift Audio Unit plugin for real-time use in Logic.
 
+## The score view
+
+![The score view](docs/score.png)
+
+The report opens with the reharmonized progression on a grand staff. Black
+noteheads are the chord the chart or the ensemble heard at that beat; red
+noteheads are what bebop adds at the chosen spice and voicing, drawn in the
+register the MIDI plays them. The chord symbol above each chord shows the
+change, and the reason for every change (an inserted ii-V, a tritone sub, an
+added 9th) is written out under the line. A spice x voicing selector switches
+variants in place. To reproduce the image:
+
+```bash
+bebop --chart charts/demo.txt --spice-sweep '0.3,0.5' --voicings rootless,evans \
+      --html-report output/demo/demo.html --out output/demo/demo.mid
+```
+
 ## Quick start
 
 ```bash
@@ -396,7 +413,7 @@ is two beats each in 4/4.
 |---|---|
 | `--print` | Print every input source's chord progression and the ensemble consensus to stdout, plus a disagreement report sorted by noisiest bars first |
 | `--suggest-chart PATH` | Write the ensemble consensus as a Real Book-style chord chart you can audit, diff, and edit. Then re-run with that file as `--chart` |
-| `--html-report PATH` | Write a single-page HTML audit. Embeds the original audio, every variant as `<audio>` players, a per-cell mixer with comp volume sliders, a **duck song bass** toggle (swaps in a pre-rendered HPF version of the song so the comp's bass cuts through; cutoff via `--duck-hz`), a **📋 Chord chart + theory** popup per cell (shows the bar-by-bar progression with theory annotations like "tritone sub", "added maj7", "secondary dominant" plus voicing breakdowns showing scale degrees), the disagreement table, and a chord-chart diff (hand vs. ensemble). The currently-playing chord is highlighted in the popup during playback. Works from `file://` |
+| `--html-report PATH` | Write a single-page HTML audit. Embeds a **Score** section (the reharmonized progression on a grand staff, the chart's chord in black and bebop's additions in red, the reason for each change under the line), the original audio, every variant as `<audio>` players, a per-cell mixer with comp volume sliders, a **duck song bass** toggle (swaps in a pre-rendered HPF version of the song so the comp's bass cuts through; cutoff via `--duck-hz`), a **📋 Chord chart + theory** popup per cell (shows the bar-by-bar progression with theory annotations like "tritone sub", "added maj7", "secondary dominant" plus voicing breakdowns showing scale degrees), the disagreement table, and a chord-chart diff (hand vs. ensemble). The currently-playing chord is highlighted in the popup during playback. Works from `file://` |
 | `--duck-hz N` | Cutoff Hz for the **duck song bass** pre-rendered HPF version. Default `200`. Lower (e.g. `120`) preserves more low-mids of the song; higher (e.g. `400`) is more aggressive and exposes the comp's bass more |
 
 ## Architecture in one line each

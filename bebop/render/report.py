@@ -207,6 +207,27 @@ tr:hover { background: #fafbfc; }
 .voicing-notes .iv    { color: #555; }
 .voicing-notes .bass-row .pitch { color: #1a4d8f; }   /* bass note in blue */
 .voicing-notes .bass-row .role  { color: #1a4d8f; }
+
+.score-controls { display: flex; align-items: center; gap: 1.5rem; flex-wrap: wrap;
+                  margin: 0.8rem 0; }
+.score-controls label { font-size: 0.85rem; color: #555; }
+.score-controls select {
+    margin-left: 0.4rem; padding: 0.35rem 0.6rem; font-size: 0.85rem;
+    background: #f3f4f6; color: #222; border: 1px solid #d1d5db; border-radius: 5px;
+}
+.score-legend { display: flex; align-items: center; gap: 0.8rem; font-size: 0.8rem; color: #555; }
+.score-legend .swatch {
+    display: inline-block; width: 0.8em; height: 0.8em; border-radius: 2px;
+    margin-right: 0.3em; vertical-align: -0.1em;
+}
+.score-legend .swatch.black { background: #222; }
+.score-legend .swatch.red { background: #c0392b; }
+.score-wrap { background: #fff; border: 1px solid #eaeaea; border-radius: 8px;
+              padding: 1rem; overflow-x: auto; }
+.score-system + .score-system { margin-top: 0.5rem; }
+.score-notes { font-size: 0.8rem; color: #555; margin: 0.3rem 0 1rem; line-height: 1.5; }
+.score-notes b { color: #222; font-weight: 600; }
+.score-notes .sym { color: #c0392b; font-weight: 600; }
 """
 
 _JS = """
@@ -470,6 +491,303 @@ _JS = """
 """
 
 
+_SCORE_JS = r"""
+(() => {
+    const container = document.getElementById('score');
+    if (!container) return;
+    if (!window.Vex) {
+        container.textContent = 'The score needs VexFlow from cdnjs; open this page with network access.';
+        return;
+    }
+    const { Renderer, Stave, StaveNote, Voice, Formatter, Accidental, StaveConnector, Dot } = Vex.Flow;
+    const RED = { fillStyle: '#c0392b', strokeStyle: '#c0392b' };
+
+    const data = window._bebopExplainer || { progressions: {}, voicings: {} };
+    const progressions = data.progressions || {};
+    const voicingsMap = data.voicings || {};
+    const [TS_NUM, TS_DEN] = data.time_signature || [4, 4];
+
+    // the six durations (in quarter-note beats) the score can render; anything
+    // else picks whichever of these is closest
+    const DURATIONS = [4, 3, 2, 1.5, 1, 0.5];
+    const DUR_CODE = { 4: 'w', 3: 'h', 2: 'h', 1.5: 'q', 1: 'q', 0.5: '8' };
+    const DUR_DOTTED = { 3: true, 1.5: true };
+
+    const nearestDuration = (beats) => DURATIONS.reduce(
+        (best, d) => (Math.abs(d - beats) < Math.abs(best - beats) ? d : best), DURATIONS[0]);
+
+    const toVexDuration = (beats) => {
+        const d = nearestDuration(beats);
+        return { code: DUR_CODE[d], dotted: !!DUR_DOTTED[d] };
+    };
+
+    // "Bb4" -> "bb/4", "F#3" -> "f#/3", "C4" -> "c/4"
+    const toVexKey = (name) => {
+        const m = /^([A-Ga-g])([#b]?)(-?\d+)$/.exec(name || 'C4');
+        return m ? `${m[1].toLowerCase()}${m[2]}/${m[3]}` : 'c/4';
+    };
+
+    // double-bass parts are written an octave above where they sound
+    const bassDisplayName = (name) => (name ? name.replace(/(-?\d+)$/, (o) => String(+o + 1)) : null);
+
+    // chord symbols: first letter is the root, never touched; everything after
+    // it is quality/extensions, where # and b are accidentals to prettify
+    const prettyChord = (sym) => (!sym ? sym : sym[0] + sym.slice(1).replace(/#/g, '♯').replace(/b/g, '♭'));
+
+    // theory notes are prose ("half-step below", "borrowed") so only prettify
+    // a b/# immediately before a digit (an extension like "b9") or right after
+    // an uppercase note letter (a note name like "Bb" or "F#"); words like
+    // "below"/"borrowed" start lowercase so they're untouched either way
+    const prettyNote = (text) => text
+        .replace(/b(\d)/g, '♭$1').replace(/#(\d)/g, '♯$1')
+        .replace(/([A-G])b(?![a-z])/g, '$1♭').replace(/([A-G])#/g, '$1♯');
+
+    const escapeHtml = (s) => String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const groupByBar = (rows) => {
+        const measures = [];
+        let cur = null;
+        rows.forEach((row, i) => {
+            if (!cur || cur.bar !== row.bar) {
+                cur = { bar: row.bar, idx: [] };
+                measures.push(cur);
+            }
+            cur.idx.push(i);
+        });
+        return measures;
+    };
+
+    function draw(progKey, voicingKey) {
+        container.innerHTML = '';
+        const rows = progressions[progKey] || [];
+        const vs = voicingsMap[voicingKey] || [];
+        if (!rows.length) return;
+
+        const measures = groupByBar(rows);
+        const width = container.clientWidth || 800;
+        let barsPerSystem = 4;
+        while (barsPerSystem > 1 && width / barsPerSystem < 190) barsPerSystem--;
+        const measureWidth = (width - 8) / barsPerSystem;
+
+        // chord labels sit on shelf 1 and lift to shelf 3 on collision; TOP
+        // leaves room for the lift
+        const TOP = 20, STAVE_GAP = 100;
+        const svgHeight = TOP + STAVE_GAP + 100;
+
+        const connect = (ctx, treble, bass, type) => {
+            new StaveConnector(treble, bass).setType(type).setContext(ctx).draw();
+        };
+
+        let prevKey;
+        let globalMeasureIdx = 0;
+
+        for (let sysStart = 0; sysStart < measures.length; sysStart += barsPerSystem) {
+            const sysMeasures = measures.slice(sysStart, sysStart + barsPerSystem);
+
+            const sysDiv = document.createElement('div');
+            sysDiv.className = 'score-system';
+            const svgDiv = document.createElement('div');
+            svgDiv.className = 'score-svg';
+            const notesP = document.createElement('p');
+            notesP.className = 'score-notes';
+            sysDiv.appendChild(svgDiv);
+            sysDiv.appendChild(notesP);
+            container.appendChild(sysDiv);
+
+            const renderer = new Renderer(svgDiv, Renderer.Backends.SVG);
+            renderer.resize(width, svgHeight);
+            const ctx = renderer.getContext();
+
+            const noteEntries = [];
+            let lastBar = null;
+            let prevEntrySym = null;
+            let prevEntryNote = null;
+
+            sysMeasures.forEach((measure, posInSys) => {
+                const x = posInSys * measureWidth + 4;
+                const y = TOP;
+                const isFirstOfSystem = posInSys === 0;
+                const isVeryFirstMeasure = globalMeasureIdx === 0;
+
+                const measureRows = measure.idx.map((i) => rows[i]);
+                const key = measureRows[0].key || null;
+                const keyChanged = key !== prevKey;
+
+                const trebleStave = new Stave(x, y, measureWidth);
+                const bassStave = new Stave(x, y + STAVE_GAP, measureWidth);
+
+                if (isFirstOfSystem) {
+                    trebleStave.addClef('treble');
+                    bassStave.addClef('bass');
+                }
+                if (isVeryFirstMeasure) {
+                    trebleStave.addTimeSignature(`${TS_NUM}/${TS_DEN}`);
+                    bassStave.addTimeSignature(`${TS_NUM}/${TS_DEN}`);
+                }
+                if ((isFirstOfSystem || keyChanged) && key) {
+                    trebleStave.addKeySignature(key);
+                    bassStave.addKeySignature(key);
+                }
+                prevKey = key;
+
+                trebleStave.setContext(ctx).draw();
+                bassStave.setContext(ctx).draw();
+
+                if (isFirstOfSystem) {
+                    connect(ctx, trebleStave, bassStave, StaveConnector.type.BRACE);
+                    connect(ctx, trebleStave, bassStave, StaveConnector.type.SINGLE_LEFT);
+                }
+                connect(ctx, trebleStave, bassStave, StaveConnector.type.SINGLE_RIGHT);
+
+                const trebleNotes = [];
+                const bassNotes = [];
+                const redIdxByNote = [];
+                const bassRedByNote = [];
+
+                measure.idx.forEach((i) => {
+                    const row = rows[i];
+                    const v = vs[i] || null;
+                    const { code, dotted } = toVexDuration(row.duration_beats);
+                    const origPcs = row.original_pcs || [];
+                    const isRed = (pc) => origPcs.length === 0 || !origPcs.includes(((pc % 12) + 12) % 12);
+
+                    const pitches = (v && v.pitches) || [];
+                    const pitchNames = (v && v.pitch_names) || [];
+                    const trebleKeys = pitches.length ? pitchNames.map(toVexKey) : ['b/4'];
+                    const trebleNote = new StaveNote({
+                        clef: 'treble', keys: trebleKeys,
+                        duration: pitches.length ? code : code + 'r', auto_stem: true,
+                    });
+                    const redIdx = new Set();
+                    pitches.forEach((p, idx) => {
+                        if (isRed(p)) { trebleNote.setKeyStyle(idx, RED); redIdx.add(idx); }
+                    });
+                    if (dotted) Dot.buildAndAttach([trebleNote], { all: true });
+                    trebleNotes.push(trebleNote);
+                    redIdxByNote.push(redIdx);
+
+                    // written an octave above sounding pitch, like a real double-bass part
+                    const bassName = v && v.bass_name;
+                    const bassKey = bassName ? toVexKey(bassDisplayName(bassName)) : 'd/3';
+                    const bassNote = new StaveNote({
+                        clef: 'bass', keys: [bassKey],
+                        duration: bassName ? code : code + 'r',
+                    });
+                    const bassIsRed = !!bassName && isRed(v.bass_pitch);
+                    if (bassIsRed) bassNote.setStyle(RED);
+                    if (dotted) Dot.buildAndAttach([bassNote], { all: true });
+                    bassNotes.push(bassNote);
+                    bassRedByNote.push(bassIsRed);
+                });
+
+                const tv = new Voice({ num_beats: TS_NUM, beat_value: TS_DEN })
+                    .setStrict(false).addTickables(trebleNotes);
+                const bv = new Voice({ num_beats: TS_NUM, beat_value: TS_DEN })
+                    .setStrict(false).addTickables(bassNotes);
+                Accidental.applyAccidentals([tv, bv], key || 'C');
+
+                trebleNotes.forEach((note, idx) => {
+                    const redSet = redIdxByNote[idx];
+                    note.getModifiers().forEach((mod) => {
+                        if (mod instanceof Accidental && redSet.has(mod.getIndex())) mod.setStyle(RED);
+                    });
+                });
+                bassNotes.forEach((note, idx) => {
+                    if (!bassRedByNote[idx]) return;
+                    note.getModifiers().forEach((mod) => {
+                        if (mod instanceof Accidental) mod.setStyle(RED);
+                    });
+                });
+
+                new Formatter().joinVoices([tv]).joinVoices([bv]).formatToStave([tv, bv], trebleStave);
+                tv.draw(ctx, trebleStave);
+                bv.draw(ctx, bassStave);
+
+                // chord symbols: black is the original chord, shown once at the start
+                // of its span (a run of chords over the same original harmony); red is
+                // whatever changed; a chord that repeats the previous one carries no label
+                let chordLowerEnd = -Infinity;
+                measure.idx.forEach((rowIdx, i) => {
+                    const row = rows[rowIdx];
+                    const note = trebleNotes[i];
+                    const prevRow = rowIdx > 0 ? rows[rowIdx - 1] : null;
+                    const newSym = row.new_symbol + (row.new_bass ? '/' + row.new_bass : '');
+                    const isSpanStart = !prevRow || prevRow.bar !== row.bar
+                        || prevRow.original_symbol !== row.original_symbol;
+                    const showOrig = !!row.original_symbol && isSpanStart;
+                    const changed = !row.original_symbol || newSym !== row.original_symbol;
+                    const isRepeat = !!prevRow && row.new_symbol === prevRow.new_symbol;
+                    const showNew = changed && !isRepeat;
+                    if (!showOrig && !showNew) return;
+
+                    const origText = showOrig ? prettyChord(row.original_symbol) : null;
+                    const newText = showNew ? prettyChord(newSym) : null;
+                    ctx.save();
+                    ctx.setFont('-apple-system, Helvetica Neue, Arial', 13, 'bold');
+                    const origW = origText ? ctx.measureText(origText).width : 0;
+                    const gap = origText && newText ? 5 : 0;
+                    const newW = newText ? ctx.measureText(newText).width : 0;
+                    const nx = Math.min(note.getAbsoluteX(), width - 4 - origW - gap - newW);
+                    // the lower shelf is the default; only a genuine collision with the
+                    // previous label lifts this one to the upper shelf
+                    const useUpper = nx < chordLowerEnd + 6;
+                    const ny = trebleStave.getYForTopText(useUpper ? 3 : 1);
+                    if (origText) {
+                        ctx.setFillStyle('#222');
+                        ctx.fillText(origText, nx, ny);
+                    }
+                    if (newText) {
+                        ctx.setFillStyle(RED.fillStyle);
+                        ctx.fillText(newText, nx + origW + gap, ny);
+                    }
+                    if (!useUpper) chordLowerEnd = nx + origW + gap + newW;
+                    ctx.restore();
+                });
+
+                // theory notes go under the system as HTML so they wrap and select
+                // like normal text
+                measure.idx.forEach((rowIdx) => {
+                    const row = rows[rowIdx];
+                    if (!row.theory_note) return;
+                    const sym = row.new_symbol + (row.new_bass ? '/' + row.new_bass : '');
+                    // a run of adjacent chords in the same bar with the same symbol
+                    // and the same reason says nothing new the first entry didn't
+                    if (row.bar === lastBar && sym === prevEntrySym && row.theory_note === prevEntryNote) return;
+                    const barPart = row.bar !== lastBar ? `<b>bar ${row.bar}</b> ` : '';
+                    lastBar = row.bar;
+                    prevEntrySym = sym;
+                    prevEntryNote = row.theory_note;
+                    noteEntries.push(`${barPart}<span class="sym">${escapeHtml(prettyChord(sym))}</span>: `
+                        + escapeHtml(prettyNote(row.theory_note)));
+                });
+
+                globalMeasureIdx++;
+            });
+
+            notesP.innerHTML = noteEntries.join(' · ');
+        }
+    }
+
+    const select = document.getElementById('score-pick');
+    const redrawFromSelect = () => {
+        if (!select || !select.options.length) return;
+        const opt = select.options[select.selectedIndex];
+        draw(opt.dataset.prog, opt.dataset.voicing);
+    };
+    if (select) select.addEventListener('change', redrawFromSelect);
+
+    let resizeTimer = null;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(redrawFromSelect, 150);
+    });
+
+    redrawFromSelect();
+})();
+"""
+
+
 def _render_diff(hand: str, suggested: str) -> str:
     diff = difflib.unified_diff(
         hand.splitlines(),
@@ -490,6 +808,79 @@ def _render_diff(hand: str, suggested: str) -> str:
         else:
             out.append(esc)
     return "\n".join(out) if out else "(charts identical)"
+
+
+def _score_option_label(spice_str: str, voicing_style: str, alignment: str,
+                        source: str, show_source: bool) -> str:
+    label = f"spice {spice_str} · {voicing_style}"
+    if alignment != "raw":
+        label += " · aligned"
+    if show_source:
+        label += f" · midi: {source}"
+    return label
+
+
+def _render_score_controls(explainer_data: dict) -> str:
+    """One <option> per (progression key, voicing key) pair, in matrix order:
+
+    spice ascending (like the matrix rows), then alignment/midi-source (like
+    the matrix's per-cell tie-break), then voicing name ascending (like the
+    matrix columns).
+    """
+    progressions = explainer_data.get("progressions") or {}
+    voicings_map = explainer_data.get("voicings") or {}
+    if not progressions:
+        return ""
+
+    def split_pk(pk: str) -> tuple[str, str, str]:
+        source, spice_str, alignment = pk.rsplit("_", 2)
+        return source, spice_str, alignment
+
+    alignment_order = {"raw": 0, "aligned": 1}
+    sources = sorted({split_pk(pk)[0] for pk in progressions})
+    source_order = {s: i for i, s in enumerate(sources)}
+    show_source = len(sources) > 1
+
+    pks = sorted(progressions, key=lambda pk: (
+        float(split_pk(pk)[1]),
+        alignment_order.get(split_pk(pk)[2], 99),
+        source_order.get(split_pk(pk)[0], 99),
+    ))
+
+    options: list[str] = []
+    for pk in pks:
+        source, spice_str, alignment = split_pk(pk)
+        vks = sorted((vk for vk in voicings_map if vk.startswith(pk + "_")),
+                    key=lambda vk: vk[len(pk) + 1:])
+        for vk in vks:
+            voicing_style = vk[len(pk) + 1:]
+            label = _score_option_label(spice_str, voicing_style, alignment, source, show_source)
+            options.append(
+                f'<option data-prog="{html_lib.escape(pk)}" '
+                f'data-voicing="{html_lib.escape(vk)}">{html_lib.escape(label)}</option>'
+            )
+    return "\n".join(options)
+
+
+def _render_score_section(explainer_data: dict) -> str:
+    options_html = _render_score_controls(explainer_data)
+    parts: list[str] = []
+    parts.append('<h2>Score</h2>')
+    parts.append('<p class="meta">Black noteheads are the chord the chart or the ensemble '
+                 'heard at that beat. Red noteheads are what bebop adds at this spice and '
+                 'voicing: the pitches the MIDI plays, in the register it plays them. The bass '
+                 'is written an octave above where it sounds, as double-bass parts are. The '
+                 'chord symbol above each chord shows the change; the reasons are listed under '
+                 'each line.</p>')
+    parts.append('<div class="score-controls">')
+    parts.append(f'<label>variant <select id="score-pick">{options_html}</select></label>')
+    parts.append('<span class="score-legend">'
+                 '<span class="swatch black"></span> in the original chord '
+                 '<span class="swatch red"></span> added by bebop'
+                 '</span>')
+    parts.append('</div>')
+    parts.append('<div id="score" class="score-wrap"></div>')
+    return "\n".join(parts)
 
 
 def _render_bass_variant(c: MatrixCell, report_dir: Path,
@@ -712,6 +1103,7 @@ def write_html_report(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     report_dir = output_path.parent
     has_original = original_audio_path is not None and Path(original_audio_path).exists()
+    has_score = bool(explainer_data and explainer_data.get("progressions"))
 
     parts: list[str] = []
     parts.append('<!DOCTYPE html>')
@@ -750,6 +1142,9 @@ def write_html_report(
     else:
         parts.append('<p class="meta"><em>(no original audio supplied — pass --mix-with to enable '
                      'in-browser overlay)</em></p>')
+
+    if has_score:
+        parts.append(_render_score_section(explainer_data))
 
     if cells:
         parts.append('<h2>Comp matrix</h2>')
@@ -791,7 +1186,15 @@ def write_html_report(
         injected = json.dumps({"bpm": bpm, "progressions": {}, "voicings": {}})
     parts.append(f'<script>window._bebopExplainer = {injected};</script>')
 
+    if has_score:
+        # jsdelivr serves the real 4.2.2 build; cdnjs's files under that version
+        # are the legacy 3.0.9 bundle, which lacks Dot.buildAndAttach
+        parts.append('<script src="https://cdn.jsdelivr.net/npm/vexflow@4.2.2/build/cjs/'
+                     'vexflow.js"></script>')
+
     parts.append(f'<script>{_JS}</script>')
+    if has_score:
+        parts.append(f'<script>{_SCORE_JS}</script>')
     parts.append('</body></html>')
     output_path.write_text("\n".join(parts))
     return output_path

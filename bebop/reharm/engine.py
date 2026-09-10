@@ -22,6 +22,7 @@ from bebop.reharm.substitutions import (
     insert_two_five,
     modal_interchange,
     parse_root,
+    prefer_flats_for_key,
     side_slip,
     tritone_sub,
 )
@@ -74,6 +75,7 @@ def reharmonize(seq: ChordSequence, *, spice: float = 0.5, seed: int | None = 0)
         next_chords: list[Chord] = []
         for c in chords:
             ctx.key_pc, ctx.key_is_major = _parse_key_string(seq.key_at(c.start_beat))
+            ctx.prefer_flats = prefer_flats_for_key(seq.key_at(c.start_beat))
             result = sub(c, ctx)
             if isinstance(result, list):
                 next_chords.extend(result)

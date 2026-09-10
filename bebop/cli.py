@@ -43,13 +43,6 @@ from bebop.types import ChordSequence
 from bebop.voicing.dynamics import compute_loudness_envelope
 
 
-_PITCH_NAMES_SHARP = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-
-
-def _midi_to_name(midi: int) -> str:
-    return f"{_PITCH_NAMES_SHARP[midi % 12]}{midi // 12 - 1}"
-
-
 def _cached(audio_path: Path, source: str, bpm: float, fn) -> ChordSequence:
     """Try cache, run `fn()` on miss, store the result."""
     seq = cache.load(audio_path, source, bpm)
@@ -524,11 +517,13 @@ def main(argv: list[str] | None = None) -> int:
             # capture the chord-comparison once per (midi_source, spice, alignment)
             prog_key = f"{midi_source_label}_{spice:.2f}_{alignment}"
             if prog_key not in explainer_progressions:
-                rows = chart_comparison(original_seq, reharmed)
+                rows = chart_comparison(original_seq, reharmed,
+                                        beats_per_bar=seq_for_alignment.beats_per_bar)
                 explainer_progressions[prog_key] = [
                     {"bar": r.bar, "beat": r.beat, "duration_beats": r.duration_beats,
-                     "original_symbol": r.original_symbol, "new_symbol": r.new_symbol,
-                     "new_bass": r.new_bass, "theory_note": r.theory_note}
+                     "original_symbol": r.original_symbol, "original_pcs": list(r.original_pcs),
+                     "new_symbol": r.new_symbol, "new_bass": r.new_bass, "theory_note": r.theory_note,
+                     "key": reharmed.key_at(r.beat)}
                     for r in rows
                 ]
             # capture voicing breakdown once per (midi_source, spice, alignment, voicing)
@@ -540,11 +535,11 @@ def main(argv: list[str] | None = None) -> int:
                 explainer_voicings[vkey] = [
                     {"chord_symbol": v.chord_symbol,
                      "bass_pitch": v.bass_pitch,
-                     "bass_name": _midi_to_name(v.bass_pitch),
+                     "bass_name": v.bass_name,
                      "bass_interval": v.bass_interval,
                      "intervals": list(v.intervals),
                      "pitches": list(v.chord_pitches),
-                     "pitch_names": [_midi_to_name(p) for p in v.chord_pitches],
+                     "pitch_names": list(v.pitch_names),
                      "summary": v.summary}
                     for v in vbs
                 ]
@@ -631,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
             explainer_data={
                 "progressions": explainer_progressions,
                 "voicings": explainer_voicings,
+                "time_signature": list(seq.time_signature),
             },
         )
         print(f"\nwrote HTML report: {report_path}")
