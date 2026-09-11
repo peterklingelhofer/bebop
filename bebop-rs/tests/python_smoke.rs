@@ -20,10 +20,10 @@ fn embedded_python_initializes_and_imports_bebop() {
 #[test]
 fn embedded_python_can_call_rhythm_module() {
     use pyo3::prelude::*;
-    Python::with_gil(|py| {
+    Python::attach(|py| {
         python::ensure_venv_on_path(py).expect("venv on sys.path");
         // call bebop.rhythm.all_rhythm_names() and verify charleston is there
-        let rhythm = py.import_bound("bebop.rhythm").expect("import bebop.rhythm");
+        let rhythm = py.import("bebop.rhythm").expect("import bebop.rhythm");
         let names: Vec<String> = rhythm
             .getattr("all_rhythm_names")
             .unwrap()

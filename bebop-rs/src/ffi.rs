@@ -257,11 +257,11 @@ fn record_error<E: std::fmt::Display>(e: E) {
 #[no_mangle]
 pub extern "C" fn bebop_init() -> *mut BebopHandle {
     let r = std::panic::catch_unwind(AssertUnwindSafe(|| -> PyResult<()> {
-        Python::with_gil(|py| ensure_venv_on_path(py))?;
+        Python::attach(|py| ensure_venv_on_path(py))?;
         // Pre-import bebop on this thread so Phase-C runtime calls don't
         // pay the import cost on the worker thread's first iteration.
-        Python::with_gil(|py| -> PyResult<()> {
-            let _ = py.import_bound("bebop")?;
+        Python::attach(|py| -> PyResult<()> {
+            let _ = py.import("bebop")?;
             Ok(())
         })?;
         Ok(())
@@ -429,7 +429,7 @@ pub unsafe extern "C" fn bebop_process_audio(
 
             // Phase 3: run Python analysis without the state lock held —
             // takes ~50 ms; don't block other FFI callers.
-            let analysis = Python::with_gil(|py| -> PyResult<Option<(String, String)>> {
+            let analysis = Python::attach(|py| -> PyResult<Option<(String, String)>> {
                 ensure_venv_on_path(py)?;
                 run_analysis(py, &window, sample_rate, &last_key)
             })?;
@@ -488,7 +488,7 @@ pub unsafe extern "C" fn bebop_process_audio(
             // Phase 5: generate comp events without the state lock held.
             let Some((bpm, voicing, rhythm, spice, octave_shift, prev_bass, prev_pitches)) =
                 comp_args else { continue; };
-            let comp = Python::with_gil(|py| -> PyResult<Option<CompResult>> {
+            let comp = Python::attach(|py| -> PyResult<Option<CompResult>> {
                 run_comp(py, &chord, bpm, &voicing, &rhythm, spice,
                          octave_shift, prev_bass, prev_pitches.as_deref())
             })?;
@@ -675,13 +675,14 @@ fn run_comp(
     prev_pitches: Option<&[i32]>,
 ) -> PyResult<Option<CompResult>> {
     let helper_src = include_str!("../python/bebop_native_comp.py");
-    let module = PyModule::from_code_bound(
+    let helper_src = CString::new(helper_src)?;
+    let module = PyModule::from_code(
         py,
-        helper_src,
-        "bebop_native_comp.py",
-        "bebop_native_comp",
+        helper_src.as_c_str(),
+        c"bebop_native_comp.py",
+        c"bebop_native_comp",
     )?;
-    let kwargs = PyDict::new_bound(py);
+    let kwargs = PyDict::new(py);
     kwargs.set_item("bpm", bpm as f64)?;
     kwargs.set_item("voicing", voicing)?;
     kwargs.set_item("rhythm", rhythm)?;
@@ -957,9 +958,9 @@ pub unsafe extern "C" fn bebop_set_param(
         2 => {
             // Resolve via the same Python helper that defines names —
             // do this lazily so we don't pay it on every set.
-            let names = match Python::with_gil(|py| -> PyResult<Vec<String>> {
+            let names = match Python::attach(|py| -> PyResult<Vec<String>> {
                 ensure_venv_on_path(py)?;
-                let m = py.import_bound("bebop.rhythm")?;
+                let m = py.import("bebop.rhythm")?;
                 let v: Vec<String> = m.getattr("all_rhythm_names")?
                     .call0()?
                     .extract()?;
@@ -1024,16 +1025,17 @@ fn run_analysis(
     // Convert samples to a Python list — we let numpy convert from there.
     // Slightly inefficient (a copy) but fine at our cadence (~3 Hz).
     // Phase C.5b can switch to numpy.frombuffer for zero-copy if needed.
-    let samples_list = PyList::new_bound(py, samples.iter().map(|&s| s as f64));
+    let samples_list = PyList::new(py, samples.iter().map(|&s| s as f64))?;
 
     let helper_src = include_str!("../python/bebop_native_analyze.py");
-    let module = PyModule::from_code_bound(
+    let helper_src = CString::new(helper_src)?;
+    let module = PyModule::from_code(
         py,
-        helper_src,
-        "bebop_native_analyze.py",
-        "bebop_native_analyze",
+        helper_src.as_c_str(),
+        c"bebop_native_analyze.py",
+        c"bebop_native_analyze",
     )?;
-    let kwargs = PyDict::new_bound(py);
+    let kwargs = PyDict::new(py);
     kwargs.set_item("sample_rate", sample_rate as f64)?;
     kwargs.set_item("last_key", last_key)?;
     let result = module
