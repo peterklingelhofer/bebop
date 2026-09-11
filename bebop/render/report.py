@@ -600,6 +600,9 @@ _SCORE_JS = r"""
             const ctx = renderer.getContext();
 
             const noteEntries = [];
+            // the right edge of the last chord label on the lower shelf, carried
+            // across the system so a label can't run into the next bar's
+            let chordLowerEnd = -Infinity;
             let lastBar = null;
             let prevEntrySym = null;
             let prevEntryNote = null;
@@ -707,7 +710,6 @@ _SCORE_JS = r"""
                 // chord symbols: black is the original chord, shown once at the start
                 // of its span (a run of chords over the same original harmony); red is
                 // whatever changed; a chord that repeats the previous one carries no label
-                let chordLowerEnd = -Infinity;
                 measure.idx.forEach((rowIdx, i) => {
                     const row = rows[rowIdx];
                     const note = trebleNotes[i];
