@@ -2,7 +2,7 @@
 name = "bebop-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.83"
 description = "Native Rust core for the bebop AU plugin: embeds Python via PyO3, wraps the bebop chord-recognition + comp pipeline behind a thread-safe API."
 publish = false
 
