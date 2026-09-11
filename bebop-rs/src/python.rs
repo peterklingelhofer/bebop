@@ -58,7 +58,7 @@ pub fn ensure_venv_on_path(py: Python<'_>) -> PyResult<()> {
             //      to the project root; without processing the .pth,
             //      `import bebop` fails even though the directory is on
             //      sys.path.
-            py.import_bound("site")?
+            py.import("site")?
                 .getattr("addsitedir")?
                 .call1((VENV_SITE_PACKAGES,))?;
             Ok(())
@@ -96,18 +96,18 @@ pub fn process_wav_offline(
     voicing: &str,
     rhythm: &str,
 ) -> Result<()> {
-    Python::with_gil(|py| -> Result<()> {
+    Python::attach(|py| -> Result<()> {
         ensure_venv_on_path(py)?;
         // Import the bebop package; surface a clear error if it's missing
         // (e.g. PYO3_PYTHON points at a venv that doesn't have bebop installed).
         let audio_in = py
-            .import_bound("bebop.io.audio_in")
+            .import("bebop.io.audio_in")
             .context("failed to import bebop.io.audio_in — is bebop installed in PYO3_PYTHON's venv?")?;
-        let reharm = py.import_bound("bebop.reharm")?;
-        let render = py.import_bound("bebop.render")?;
+        let reharm = py.import("bebop.reharm")?;
+        let render = py.import("bebop.render")?;
 
         // parse_audio(wav_path, bpm=..., windows_per_bar=2, beats_per_bar=4)
-        let parse_kwargs = pyo3::types::PyDict::new_bound(py);
+        let parse_kwargs = pyo3::types::PyDict::new(py);
         parse_kwargs.set_item("bpm", bpm)?;
         parse_kwargs.set_item("windows_per_bar", 2)?;
         parse_kwargs.set_item("beats_per_bar", 4)?;
@@ -117,7 +117,7 @@ pub fn process_wav_offline(
 
         // reharmonize(seq, spice=..., seed=0) — pass seed=0 so output is
         // deterministic across runs (matches the Python CLI's default).
-        let reharm_kwargs = pyo3::types::PyDict::new_bound(py);
+        let reharm_kwargs = pyo3::types::PyDict::new(py);
         reharm_kwargs.set_item("spice", spice)?;
         reharm_kwargs.set_item("seed", 0i64)?;
         let reharmed = reharm
@@ -126,7 +126,7 @@ pub fn process_wav_offline(
 
         // write_midi(seq, out_path, rhythm=..., voicing=..., include_bass=True,
         //            walking_bass=False, piano_bass=False)
-        let mid_kwargs = pyo3::types::PyDict::new_bound(py);
+        let mid_kwargs = pyo3::types::PyDict::new(py);
         mid_kwargs.set_item("rhythm", rhythm)?;
         mid_kwargs.set_item("voicing", voicing)?;
         mid_kwargs.set_item("include_bass", true)?;
@@ -146,14 +146,14 @@ pub fn process_wav_offline(
 /// Sanity check: import bebop and return its declared version.
 /// Used by the Phase-A "PyO3 alive" test.
 pub fn bebop_version() -> Result<String> {
-    Python::with_gil(|py| -> Result<String> {
+    Python::attach(|py| -> Result<String> {
         ensure_venv_on_path(py)?;
         // verify bebop is importable (we don't use the module, but the
         // import surfaces a clear error if PYO3_PYTHON's venv lacks it)
-        let _bebop = py.import_bound("bebop")?;
+        let _bebop = py.import("bebop")?;
         // bebop has no __version__ attr, so look at the package metadata
         let v: String = py
-            .import_bound("importlib.metadata")?
+            .import("importlib.metadata")?
             .getattr("version")?
             .call1(("bebop",))?
             .extract()?;
