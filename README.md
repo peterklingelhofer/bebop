@@ -11,7 +11,7 @@ transformer-based recognizer) are ML; the chart, MIDI, and librosa chromagram
 paths are not. Hand it a chord chart and no ML runs at all.
 
 Built as a Python engine, with a Rust core (via PyO3) for performance-critical
-paths and a native Swift Audio Unit plugin for real-time use in Logic.
+paths and a native C++ Audio Unit plugin for real-time use in Logic.
 
 ## The score view
 
